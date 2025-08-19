@@ -1,0 +1,166 @@
+defaults:
+  - _self_
+
+hydra:
+  run:
+    dir: ${logdir}
+
+_target_: agent.finetune.train_sac_diffusion_ebm_agent.TrainSACDiffusionEBMAgent
+
+name: ${env_name}_sac_diffusion_ebm_mlp_ta${horizon_steps}_td${denoising_steps}_tdf${ft_denoising_steps}
+logdir: ${oc.env:DPPO_LOG_DIR}/gym-finetune/${name}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
+base_policy_path: ${oc.env:DPPO_LOG_DIR}/gym-pretrain/hopper-medium-v2_pre_diffusion_mlp_ta4_td20/2024-06-12_23-10-05/checkpoint/state_3000.pt
+normalization_path: ${oc.env:DPPO_DATA_DIR}/gym/${env_name}/normalization.npz
+
+seed: 42
+device: cuda:0
+env_name: hopper-medium-v2
+obs_dim: 11
+action_dim: 3
+denoising_steps: 20
+ft_denoising_steps: 20
+cond_steps: 1
+horizon_steps: 4
+act_steps: 4
+
+env:
+  n_envs: 40
+  name: ${env_name}
+  max_episode_steps: 1000
+  reset_at_iteration: False
+  save_video: False
+  save_full_observations: False
+  best_reward_threshold_for_success: 3
+  wrappers:
+    mujoco_locomotion_lowdim:
+      normalization_path: ${normalization_path}
+    multi_step:
+      n_obs_steps: ${cond_steps}
+      n_action_steps: ${act_steps}
+      max_episode_steps: ${env.max_episode_steps}
+      reset_within_step: True
+
+# wandb: null
+wandb:
+  entity: ${oc.env:DPPO_WANDB_ENTITY}
+  project: gym-${env_name}-finetune-sac-ebm
+  run: ${now:%H-%M-%S}_${name}
+
+train:
+  n_train_itr: 1000
+  n_steps: 500
+  gamma: 0.99
+  
+  # SAC parameters
+  tau: 0.005
+  alpha: 0.2
+  automatic_entropy_tuning: True
+  target_entropy: -3  # -action_dim
+  
+  # Learning rates
+  actor_lr: 1e-4
+  actor_weight_decay: 0
+  critic_lr: 1e-3
+  critic_weight_decay: 0
+  
+  # Buffer and batch parameters
+  buffer_size: 100000
+  batch_size: 256
+  replay_ratio: 1
+  
+  # Evaluation parameters
+  n_eval_episode: 10
+  n_explore_steps: 1000
+  
+  # Logging and saving
+  save_model_freq: 100
+  val_freq: 10
+  render:
+    freq: 1
+    num: 0
+  log_freq: 1
+
+model:
+  _target_: model.diffusion.diffusion_sac_ebm.SACDiffusionEBM
+
+  # SAC parameters
+  gamma: 0.99
+  tau: 0.005
+  alpha: 0.2
+  automatic_entropy_tuning: True
+  target_entropy: -3
+
+  # Energy scaling parameters
+  use_energy_scaling: True
+  energy_scaling_momentum: 0.99
+  energy_scaling_eps: 1e-6
+  energy_scaling_use_mad: True
+
+  # Potential-based reward shaping parameters
+  use_ebm_reward_shaping: True
+  pbrs_lambda: 0.5
+  pbrs_beta: 1.0
+  pbrs_alpha: 0.1
+  pbrs_M: 4
+  pbrs_use_mu_only: True
+  pbrs_k_use_mode: "tail:6"
+
+  # EBM model configuration
+  ebm:
+    _target_: model.ebm.EBMWrapper
+    obs_dim: ${obs_dim}
+    action_dim: ${action_dim}
+    hidden_dim: 256
+    num_layers: 4
+
+  # EBM checkpoint path (optional)
+  ebm_ckpt_path: /linting-slow-vol/EBM-Guidance/outputs/gym/ebm_best_val_hopper-v2-medium.pt
+
+  # Network configuration
+  network_path: ${base_policy_path}
+  
+  # Actor network (diffusion policy)
+  actor:
+    _target_: model.diffusion.mlp_diffusion.DiffusionMLP
+    time_dim: 16
+    mlp_dims: [512, 512, 512]
+    activation_type: ReLU
+    residual_style: True
+    cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
+    horizon_steps: ${horizon_steps}
+    action_dim: ${action_dim}
+  
+  # Critic networks (Q-functions)
+  critic_q1:
+    _target_: model.common.critic.CriticObsAct
+    cond_dim: ${obs_dim}
+    action_dim: ${action_dim}
+    mlp_dims: [256, 256, 256]
+    activation_type: Mish
+    residual_style: True
+    double_q: False
+  
+  critic_q2:
+    _target_: model.common.critic.CriticObsAct
+    cond_dim: ${obs_dim}
+    action_dim: ${action_dim}
+    mlp_dims: [256, 256, 256]
+    activation_type: Mish
+    residual_style: True
+    double_q: False
+  
+  # Value network
+  critic_v:
+    _target_: model.common.critic.CriticObs
+    cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
+    mlp_dims: [256, 256, 256]
+    activation_type: Mish
+    residual_style: True
+
+  # Diffusion parameters
+  ft_denoising_steps: ${ft_denoising_steps}
+  horizon_steps: ${horizon_steps}
+  obs_dim: ${obs_dim}
+  action_dim: ${action_dim}
+  denoising_steps: ${denoising_steps}
+  device: ${device}
