@@ -1,3 +1,64 @@
+Metadata-Version: 2.4
+Name: dppo
+Version: 0.8.0
+Summary: Fine-tuning diffusion policies with PPO.
+Project-URL: Homepage, https://diffusion-ppo.github.io/
+Classifier: Programming Language :: Python :: 3
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: av==12.3.0
+Requires-Dist: einops==0.8.0
+Requires-Dist: gdown==5.2.0
+Requires-Dist: gym==0.22.0
+Requires-Dist: hydra-core==1.3.2
+Requires-Dist: imageio==2.35.1
+Requires-Dist: matplotlib==3.7.5
+Requires-Dist: omegaconf==2.3.0
+Requires-Dist: pretty_errors==1.2.25
+Requires-Dist: torch==2.4.0
+Requires-Dist: tqdm==4.66.5
+Requires-Dist: wandb==0.17.7
+Provides-Extra: gym
+Requires-Dist: cython<3; extra == "gym"
+Requires-Dist: d4rl; extra == "gym"
+Requires-Dist: patchelf; extra == "gym"
+Provides-Extra: kitchen
+Requires-Dist: cython<3; extra == "kitchen"
+Requires-Dist: d4rl; extra == "kitchen"
+Requires-Dist: dm_control==1.0.16; extra == "kitchen"
+Requires-Dist: mujoco==3.1.6; extra == "kitchen"
+Requires-Dist: patchelf; extra == "kitchen"
+Provides-Extra: robomimic
+Requires-Dist: cython<3; extra == "robomimic"
+Requires-Dist: d4rl; extra == "robomimic"
+Requires-Dist: patchelf; extra == "robomimic"
+Requires-Dist: robomimic@ git+https://github.com/ARISE-Initiative/robomimic.git ; extra == "robomimic"
+Requires-Dist: robosuite@ git+https://github.com/ARISE-Initiative/robosuite.git@v1.4.1 ; extra == "robomimic"
+Provides-Extra: d3il
+Requires-Dist: cython<3; extra == "d3il"
+Requires-Dist: d4rl; extra == "d3il"
+Requires-Dist: gin-config; extra == "d3il"
+Requires-Dist: patchelf; extra == "d3il"
+Requires-Dist: pin; extra == "d3il"
+Provides-Extra: furniture
+Requires-Dist: cython<3; extra == "furniture"
+Requires-Dist: d4rl; extra == "furniture"
+Requires-Dist: ipdb==0.13.13; extra == "furniture"
+Requires-Dist: patchelf; extra == "furniture"
+Provides-Extra: exact
+Requires-Dist: torchdiffeq; extra == "exact"
+Provides-Extra: all
+Requires-Dist: cython<3; extra == "all"
+Requires-Dist: d4rl; extra == "all"
+Requires-Dist: gin-config; extra == "all"
+Requires-Dist: ipdb==0.13.13; extra == "all"
+Requires-Dist: patchelf; extra == "all"
+Requires-Dist: pin; extra == "all"
+Requires-Dist: robomimic@ git+https://github.com/ARISE-Initiative/robomimic.git ; extra == "all"
+Requires-Dist: robosuite@ git+https://github.com/ARISE-Initiative/robosuite.git@v1.4.1 ; extra == "all"
+Dynamic: license-file
+
 # Diffusion Policy Policy Optimization (DPPO)
 
 [[Paper](https://arxiv.org/abs/2409.00588)]&nbsp;&nbsp;[[Website](https://diffusion-ppo.github.io/)]
