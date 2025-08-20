@@ -48,7 +48,7 @@ wandb:
 train:
   n_train_itr: 1000
   n_critic_warmup_itr: 0
-  n_steps: 500
+  n_steps: 10
   gamma: 0.99
   actor_lr: 1e-4
   actor_weight_decay: 0
@@ -96,11 +96,11 @@ model:
 
   # Potential-based reward shaping parameters
   use_ebm_reward_shaping: True
-  pbrs_lambda: 1.0
-  pbrs_beta: 1.0
+  pbrs_lambda: 3.0
+  pbrs_beta: 1.5
   pbrs_alpha: 1.0
-  pbrs_M: 4
-  pbrs_use_mu_only: True
+  pbrs_M: 8
+  pbrs_use_mu_only: False
   pbrs_k_use_mode: "all"
 
   # EBM model configuration

@@ -121,6 +121,9 @@ class TrainSACDiffusionEBMAgent(TrainAgent):
         normalization_path = cfg.env.wrappers.mujoco_locomotion_lowdim.normalization_path
         stats = self._load_normalization_stats(normalization_path)
         
+        # Wire the instantiated EBM into the model if not already set
+        self.model.ebm_model = self.ebm_model.to(self.device).eval()
+        
         # Setup potential function in the model
         self.model.setup_potential_function(stats)
         
@@ -409,15 +412,14 @@ class TrainSACDiffusionEBMAgent(TrainAgent):
         self.actor_optimizer.step()
         
         # Update alpha if automatic entropy tuning is enabled
+        alpha_loss = torch.tensor(0.0, device=self.device)  # Initialize for logging
         if self.automatic_entropy_tuning:
-            # If log_probs are zeros (no-entropy variant), skip alpha update to avoid collapsing alpha->0
-            if torch.allclose(log_probs, torch.zeros_like(log_probs)):
-                alpha_loss = torch.tensor(0.0, device=self.device)
-            else:
-                alpha_loss = self.model.compute_alpha_loss(obs_batch, actions_policy, log_probs)
-                self.alpha_optimizer.zero_grad()
-                alpha_loss.backward()
-                self.model.update_alpha(self.alpha_optimizer)
+            # Use EBM surrogate log-prob for alpha tuning (allow gradients for alpha update)
+            ebm_log_probs = self.model.ebm_surrogate_log_prob(obs_batch, samples.trajectories, k=0, allow_grad=True)
+            alpha_loss = self.model.compute_alpha_loss(obs_batch, samples.trajectories[:, 0], ebm_log_probs)
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.model.update_alpha(self.alpha_optimizer)
         
         # Log losses
         if self.use_wandb and self.itr % self.log_freq == 0:
@@ -426,7 +428,7 @@ class TrainSACDiffusionEBMAgent(TrainAgent):
                 "loss/q2": q2_loss.item(),
                 "loss/v": v_loss.item(),
                 "loss/actor": actor_loss.item(),
-                "loss/alpha": alpha_loss.item() if self.automatic_entropy_tuning else 0.0,
+                "loss/alpha": alpha_loss.item(),
             }, step=self.itr, commit=True)
 
 

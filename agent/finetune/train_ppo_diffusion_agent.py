@@ -331,7 +331,7 @@ class TrainPPODiffusionAgent(TrainPPOAgent):
                         start = batch * self.batch_size
                         end = start + self.batch_size
                         inds_b = inds_k[start:end]  # b for batch
-                        batch_inds_b, denoising_inds_b = torch.unravel_index(
+                        batch_inds_b, denoising_inds_b = unravel_index(
                             inds_b,
                             (self.n_steps * self.n_envs, self.model.ft_denoising_steps),
                         )

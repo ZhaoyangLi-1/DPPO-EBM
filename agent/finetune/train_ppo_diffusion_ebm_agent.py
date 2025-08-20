@@ -25,6 +25,24 @@ from model.diffusion.diffusion_ppo_ebm import PPODiffusionEBM
 from model.diffusion.energy_utils import KFreePotential, build_k_use_indices
 
 
+def unravel_index(indices: torch.Tensor, shape: tuple):
+    """
+    Torch version of numpy.unravel_index (compatible with torch<2.1)
+    Args:
+        indices: Tensor of flat indices, shape (N,)
+        shape: tuple of ints, the target shape
+    Returns:
+        tuple of Tensors, each (N,) giving coordinates along each dimension
+    """
+    coords = []
+    for dim in reversed(shape):
+        coord = indices % dim
+        indices = indices // dim
+        coords.append(coord)
+    return tuple(reversed(coords))
+
+
+
 class KFreePotentialLegacy:
     """Deprecated. Use KFreePotential from model.diffusion.energy_utils."""
 
@@ -747,116 +765,117 @@ class TrainPPODiffusionEBMAgent(TrainPPODiffusionAgent):
                         )
                     returns_trajs = advantages_trajs + values_trajs
 
-            # k for environment step
-            obs_k = {
-                "state": einops.rearrange(
-                    obs_trajs["state"],
-                    "s e ... -> (s e) ...",
+            if not eval_mode:
+                # k for environment step
+                obs_k = {
+                    "state": einops.rearrange(
+                        obs_trajs["state"],
+                        "s e ... -> (s e) ...",
+                    )
+                }
+                chains_k = einops.rearrange(
+                    torch.tensor(chains_trajs, device=self.device).float(),
+                    "s e t h d -> (s e) t h d",
                 )
-            }
-            chains_k = einops.rearrange(
-                torch.tensor(chains_trajs, device=self.device).float(),
-                "s e t h d -> (s e) t h d",
-            )
-            returns_k = (
-                torch.tensor(returns_trajs, device=self.device).float().reshape(-1)
-            )
-            values_k = (
-                torch.tensor(values_trajs, device=self.device).float().reshape(-1)
-            )
-            advantages_k = (
-                torch.tensor(advantages_trajs, device=self.device)
-                .float()
-                .reshape(-1)
-            )
-            logprobs_k = torch.tensor(logprobs_trajs, device=self.device).float()
+                returns_k = (
+                    torch.tensor(returns_trajs, device=self.device).float().reshape(-1)
+                )
+                values_k = (
+                    torch.tensor(values_trajs, device=self.device).float().reshape(-1)
+                )
+                advantages_k = (
+                    torch.tensor(advantages_trajs, device=self.device)
+                    .float()
+                    .reshape(-1)
+                )
+                logprobs_k = torch.tensor(logprobs_trajs, device=self.device).float()
 
-            # Update policy and critic
-            total_steps = self.n_steps * self.n_envs * self.model.ft_denoising_steps
-            clipfracs = []
-            for update_epoch in range(self.update_epochs):
-                # for each epoch, go through all data in batches
-                flag_break = False
-                inds_k = torch.randperm(total_steps, device=self.device)
-                num_batch = max(1, total_steps // self.batch_size)  # skip last ones
-                for batch in range(num_batch):
-                    start = batch * self.batch_size
-                    end = start + self.batch_size
-                    inds_b = inds_k[start:end]  # b for batch
-                    batch_inds_b, denoising_inds_b = torch.unravel_index(
-                        inds_b,
-                        (self.n_steps * self.n_envs, self.model.ft_denoising_steps),
-                    )
-                    obs_b = {"state": obs_k["state"][batch_inds_b]}
-                    chains_prev_b = chains_k[batch_inds_b, denoising_inds_b]
-                    chains_next_b = chains_k[batch_inds_b, denoising_inds_b + 1]
-                    returns_b = returns_k[batch_inds_b]
-                    values_b = values_k[batch_inds_b]
-                    advantages_b = advantages_k[batch_inds_b]
-                    logprobs_b = logprobs_k[batch_inds_b, denoising_inds_b]
+                # Update policy and critic
+                total_steps = self.n_steps * self.n_envs * self.model.ft_denoising_steps
+                clipfracs = []
+                for update_epoch in range(self.update_epochs):
+                    # for each epoch, go through all data in batches
+                    flag_break = False
+                    inds_k = torch.randperm(total_steps, device=self.device)
+                    num_batch = max(1, total_steps // self.batch_size)  # skip last ones
+                    for batch in range(num_batch):
+                        start = batch * self.batch_size
+                        end = start + self.batch_size
+                        inds_b = inds_k[start:end]  # b for batch
+                        batch_inds_b, denoising_inds_b = unravel_index(
+                            inds_b,
+                            (self.n_steps * self.n_envs, self.model.ft_denoising_steps),
+                        )
+                        obs_b = {"state": obs_k["state"][batch_inds_b]}
+                        chains_prev_b = chains_k[batch_inds_b, denoising_inds_b]
+                        chains_next_b = chains_k[batch_inds_b, denoising_inds_b + 1]
+                        returns_b = returns_k[batch_inds_b]
+                        values_b = values_k[batch_inds_b]
+                        advantages_b = advantages_k[batch_inds_b]
+                        logprobs_b = logprobs_k[batch_inds_b, denoising_inds_b]
 
-                    # get loss
-                    (
-                        pg_loss,
-                        entropy_loss,
-                        v_loss,
-                        clipfrac,
-                        approx_kl,
-                        ratio,
-                        bc_loss,
-                        eta,
-                    ) = self.model.loss(
-                        obs_b,
-                        chains_prev_b,
-                        chains_next_b,
-                        denoising_inds_b,
-                        returns_b,
-                        values_b,
-                        advantages_b,
-                        logprobs_b,
-                        use_bc_loss=self.use_bc_loss,
-                        reward_horizon=self.reward_horizon,
-                    )
-                    loss = (
-                        pg_loss
-                        + entropy_loss * self.ent_coef
-                        + v_loss * self.vf_coef
-                        + bc_loss * self.bc_loss_coeff
-                    )
-                    clipfracs += [clipfrac]
+                        # get loss
+                        (
+                            pg_loss,
+                            entropy_loss,
+                            v_loss,
+                            clipfrac,
+                            approx_kl,
+                            ratio,
+                            bc_loss,
+                            eta,
+                        ) = self.model.loss(
+                            obs_b,
+                            chains_prev_b,
+                            chains_next_b,
+                            denoising_inds_b,
+                            returns_b,
+                            values_b,
+                            advantages_b,
+                            logprobs_b,
+                            use_bc_loss=self.use_bc_loss,
+                            reward_horizon=self.reward_horizon,
+                        )
+                        loss = (
+                            pg_loss
+                            + entropy_loss * self.ent_coef
+                            + v_loss * self.vf_coef
+                            + bc_loss * self.bc_loss_coeff
+                        )
+                        clipfracs += [clipfrac]
 
-                    # update policy and critic
-                    self.actor_optimizer.zero_grad()
-                    self.critic_optimizer.zero_grad()
-                    if self.learn_eta:
-                        self.eta_optimizer.zero_grad()
-                    loss.backward()
-                    if self.itr >= self.n_critic_warmup_itr:
-                        if self.max_grad_norm is not None:
-                            torch.nn.utils.clip_grad_norm_(
-                                self.model.actor_ft.parameters(), self.max_grad_norm
-                            )
-                        self.actor_optimizer.step()
-                        if self.learn_eta and batch % self.eta_update_interval == 0:
-                            self.eta_optimizer.step()
-                    self.critic_optimizer.step()
-                    log.info(
-                        f"approx_kl: {approx_kl}, update_epoch: {update_epoch}, num_batch: {num_batch}"
-                    )
+                        # update policy and critic
+                        self.actor_optimizer.zero_grad()
+                        self.critic_optimizer.zero_grad()
+                        if self.learn_eta:
+                            self.eta_optimizer.zero_grad()
+                        loss.backward()
+                        if self.itr >= self.n_critic_warmup_itr:
+                            if self.max_grad_norm is not None:
+                                torch.nn.utils.clip_grad_norm_(
+                                    self.model.actor_ft.parameters(), self.max_grad_norm
+                                )
+                            self.actor_optimizer.step()
+                            if self.learn_eta and batch % self.eta_update_interval == 0:
+                                self.eta_optimizer.step()
+                        self.critic_optimizer.step()
+                        log.info(
+                            f"approx_kl: {approx_kl}, update_epoch: {update_epoch}, num_batch: {num_batch}"
+                        )
 
-                    # Stop gradient update if KL difference reaches target
-                    if self.target_kl is not None and approx_kl > self.target_kl:
-                        flag_break = True
+                        # Stop gradient update if KL difference reaches target
+                        if self.target_kl is not None and approx_kl > self.target_kl:
+                            flag_break = True
+                            break
+                    if flag_break:
                         break
-                if flag_break:
-                    break
 
-            # Explained variation of future rewards using value function
-            y_pred, y_true = values_k.cpu().numpy(), returns_k.cpu().numpy()
-            var_y = np.var(y_true)
-            explained_var = (
-                np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-            )
+                # Explained variation of future rewards using value function
+                y_pred, y_true = values_k.cpu().numpy(), returns_k.cpu().numpy()
+                var_y = np.var(y_true)
+                explained_var = (
+                    np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+                )
 
             # Plot state trajectories (only in D3IL)
             if (

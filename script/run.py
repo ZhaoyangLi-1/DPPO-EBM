@@ -5,6 +5,7 @@ Launcher for all experiments. Download pre-training data, normalization statisti
 
 import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__) + "/.."))
 import sys
 import logging
 

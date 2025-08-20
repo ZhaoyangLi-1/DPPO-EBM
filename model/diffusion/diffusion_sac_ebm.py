@@ -8,6 +8,7 @@ capabilities, specifically for potential-based reward shaping.
 from typing import Optional, Dict, Any, List
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import logging
 
 log = logging.getLogger(__name__)
@@ -144,6 +145,138 @@ class SACDiffusionEBM(SACDiffusion):
         
         log.info(f"SACDiffusionEBM setup_potential_function: ft_denoising_steps={self.ft_denoising_steps}, k_use={self.pbrs_k_use}, valid range: 0 to {self.ft_denoising_steps-1}")
     
+    # ------------------------------------------------------------------
+    # EBM surrogate: log pi(a|s) ≈ -E_psi(s, a)
+    # ------------------------------------------------------------------
+    def _normalize_actions_for_ebm(self, actions: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize actions to [-1, 1] using self.stats if available.
+        actions: (B, H, A)
+        Note: No @torch.no_grad() to allow gradients to flow for actor loss computation.
+        """
+        if self.stats is None:
+            return actions
+        try:
+            act_min = torch.tensor(self.stats["act_min"], dtype=torch.float32, device=actions.device)
+            act_max = torch.tensor(self.stats["act_max"], dtype=torch.float32, device=actions.device)
+            if act_min.ndim == 2:
+                act_min = act_min.min(dim=0).values
+            if act_max.ndim == 2:
+                act_max = act_max.max(dim=0).values
+            act_min = act_min.view(1, 1, -1)
+            act_max = act_max.view(1, 1, -1)
+            a_norm = torch.clamp((actions - act_min) / (act_max - act_min + 1e-6) * 2 - 1, -1.0, 1.0)
+            return a_norm
+        except Exception as e:
+            log.warning(f"Action normalization for EBM failed: {e}")
+            return actions
+
+    @torch.no_grad()
+    def _normalize_actions_for_ebm_no_grad(self, actions: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize actions to [-1, 1] using self.stats if available (no gradients).
+        Used for critic loss computation where gradients are not needed.
+        actions: (B, H, A)
+        """
+        if self.stats is None:
+            return actions
+        try:
+            act_min = torch.tensor(self.stats["act_min"], dtype=torch.float32, device=actions.device)
+            act_max = torch.tensor(self.stats["act_max"], dtype=torch.float32, device=actions.device)
+            if act_min.ndim == 2:
+                act_min = act_min.min(dim=0).values
+            if act_max.ndim == 2:
+                act_max = act_max.max(dim=0).values
+            act_min = act_min.view(1, 1, -1)
+            act_max = act_max.view(1, 1, -1)
+            a_norm = torch.clamp((actions - act_min) / (act_max - act_min + 1e-6) * 2 - 1, -1.0, 1.0)
+            return a_norm
+        except Exception as e:
+            log.warning(f"Action normalization for EBM failed: {e}")
+            return actions
+
+    def ebm_surrogate_log_prob(self, obs: torch.Tensor, trajectories: torch.Tensor, k: int = 0, allow_grad: bool = False) -> torch.Tensor:
+        """
+        Compute surrogate log prob via EBM: log pi(a|s) ≈ -E_psi(s, a) at denoised step k=0.
+        obs: (B, obs_dim)
+        trajectories: (B, H, A)
+        allow_grad: Whether to allow gradients to flow (for actor loss computation)
+        returns: (B,)
+        """
+        if self.ebm_model is None:
+            return torch.zeros(obs.size(0), device=obs.device)
+
+        B = obs.size(0)
+        k_vec = torch.full((B,), int(k), dtype=torch.long, device=obs.device)
+        
+        # Use appropriate normalization method based on gradient requirement
+        if allow_grad:
+            actions_norm = self._normalize_actions_for_ebm(trajectories)
+        else:
+            actions_norm = self._normalize_actions_for_ebm_no_grad(trajectories)
+            
+        try:
+            E_out = self.ebm_model(k_idx=k_vec, views=None, poses=obs, actions=actions_norm)
+            E = E_out[0] if isinstance(E_out, (tuple, list)) else E_out
+            if E.dim() >= 2 and E.size(0) == B:
+                E = E.mean(dim=tuple(range(1, E.dim())))
+        except Exception as e:
+            log.warning(f"EBM forward failed in ebm_surrogate_log_prob: {e}")
+            return torch.zeros(B, device=obs.device)
+        return -E
+
+    def compute_actor_loss_with_ebm(self, obs: torch.Tensor, samples) -> torch.Tensor:
+        """
+        Actor loss with EBM surrogate entropy:
+          L_pi = E[ alpha*(-E_psi(s,a)) - Q(s,a_first) ]
+               = E[ -Q(s,a_first) - alpha*E_psi(s,a) ]
+        obs: (B, obs_dim)
+        samples: object with attribute trajectories (B, H, A)
+        returns: scalar loss tensor
+        """
+        actions_first = samples.trajectories[:, 0]
+        q1, q2 = self.compute_q_values(obs, actions_first)
+        q_min = torch.min(q1, q2)
+
+        # Use allow_grad=True for actor loss to enable gradient flow
+        log_probs_ebm = self.ebm_surrogate_log_prob(obs, samples.trajectories, k=0, allow_grad=True)
+        actor_loss = (self.get_alpha() * log_probs_ebm - q_min).mean()
+        return actor_loss
+
+    def compute_critic_loss(self, obs: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor, 
+                            next_obs: torch.Tensor, dones: torch.Tensor) -> tuple:
+        """
+        Override critic loss to use EBM surrogate for entropy term in targets.
+        """
+        with torch.no_grad():
+            # Sample next actions from current policy
+            next_cond = {"state": next_obs}
+            next_samples = self.forward(next_cond, deterministic=False)
+            next_actions = next_samples.trajectories[:, 0]
+
+            # Surrogate log prob via EBM on full horizon (k=0)
+            next_log_probs = self.ebm_surrogate_log_prob(next_obs, next_samples.trajectories, k=0)
+
+            # Target Q values
+            next_q1_target, next_q2_target = self.compute_target_q_values(next_obs, next_actions)
+            next_q_target = torch.min(next_q1_target, next_q2_target)
+
+            # Target values with EBM surrogate entropy
+            target_q = rewards + self.gamma * (1 - dones) * (next_q_target - self.get_alpha() * next_log_probs)
+
+        # Current Q values
+        current_q1, current_q2 = self.compute_q_values(obs, actions)
+
+        # Critic losses
+        q1_loss = F.mse_loss(current_q1, target_q)
+        q2_loss = F.mse_loss(current_q2, target_q)
+
+        # V function loss (match target_q)
+        current_v = self.compute_v_value(obs)
+        v_loss = F.mse_loss(current_v, target_q.detach())
+
+        return q1_loss, q2_loss, v_loss
+
     def compute_shaped_reward(self, obs_t: torch.Tensor, obs_tp1: torch.Tensor) -> torch.Tensor:
         """
         Compute shaped reward using EBM potential-based reward shaping.
