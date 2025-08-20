@@ -3,9 +3,9 @@ Launcher for all experiments. Download pre-training data, normalization statisti
 
 """
 
-import os
+import sys, os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import sys
-import pretty_errors
 import logging
 
 import math

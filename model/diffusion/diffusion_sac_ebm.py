@@ -84,6 +84,9 @@ class SACDiffusionEBM(SACDiffusion):
             
             # Build k_use indices for potential computation
             self.pbrs_k_use = build_k_use_indices(self.pbrs_k_use_mode, self.ft_denoising_steps)
+            
+            # Log k_use validation
+            log.info(f"SACDiffusionEBM initialization: ft_denoising_steps={self.ft_denoising_steps}, pbrs_k_use={self.pbrs_k_use}, valid range: 0 to {self.ft_denoising_steps-1}")
         
         # Initialize potential function (will be set up in setup_potential_function)
         self.potential_function = None
@@ -122,7 +125,7 @@ class SACDiffusionEBM(SACDiffusion):
             device=self.device,
         )
         
-        log.info(f"Setup potential function with k_use={self.pbrs_k_use}")
+        log.info(f"SACDiffusionEBM setup_potential_function: ft_denoising_steps={self.ft_denoising_steps}, k_use={self.pbrs_k_use}, valid range: 0 to {self.ft_denoising_steps-1}")
     
     def compute_shaped_reward(self, obs_t: torch.Tensor, obs_tp1: torch.Tensor) -> torch.Tensor:
         """
@@ -175,10 +178,15 @@ class SACDiffusionEBM(SACDiffusion):
             act_min = act_min.view(1, 1, -1)
             act_max = act_max.view(1, 1, -1)
             
-            energy_values = torch.zeros(B, K_plus_1, device=self.device)
+            energy_values = torch.zeros(B, K, device=self.device)
             
             with torch.no_grad():
-                for k in range(K_plus_1):
+                # Log k range validation (only once)
+                if not hasattr(self, '_logged_k_range'):
+                    log.info(f"SAC EBM k range validation: K={K}, valid range: 0 to {K-1}")
+                    self._logged_k_range = True
+                
+                for k in range(K):
                     actions_k = chains[:, k, :, :]
                     
                     # Normalize actions to [-1, 1]

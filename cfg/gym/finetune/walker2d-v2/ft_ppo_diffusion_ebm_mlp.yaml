@@ -16,7 +16,7 @@ env_name: walker2d-medium-v2
 obs_dim: 17
 action_dim: 6
 denoising_steps: 20
-ft_denoising_steps: 10
+ft_denoising_steps: 20
 cond_steps: 1
 horizon_steps: 4
 act_steps: 4
@@ -39,7 +39,7 @@ env:
 
 wandb:
   entity: ${oc.env:DPPO_WANDB_ENTITY}
-  project: gym-${env_name}-finetune
+  project: gym-${env_name}-finetune-ebm
   run: ${now:%H-%M-%S}_${name}
 
 train:
@@ -75,7 +75,8 @@ train:
 
 model:
   _target_: model.diffusion.diffusion_ppo_ebm.PPODiffusionEBM
-  # HP to tune
+
+  # Standard PPO parameters
   gamma_denoising: 0.99
   clip_ploss_coef: 0.01
   clip_ploss_coef_base: 0.01
@@ -83,15 +84,35 @@ model:
   randn_clip_value: 3
   min_sampling_denoising_std: 0.1
   min_logprob_denoising_std: 0.1
-  # EBM specific parameters
+
+  # Energy scaling parameters (optional; not required by theory-based PBRS)
+  use_energy_scaling: True
+  energy_scaling_momentum: 0.99
+  energy_scaling_eps: 1e-6
+  energy_scaling_use_mad: True
+
+  # Potential-based reward shaping parameters
+  # k=0: completely denoised action (no noise)
+  # k=ft_denoising_steps-1: fully noisy action (maximum noise)
   use_ebm_reward_shaping: True
-  pbrs_lambda: 0.5
+  pbrs_lambda: 1.0
   pbrs_beta: 1.0
-  pbrs_alpha: 0.1
+  pbrs_alpha: 1.0
   pbrs_M: 4
   pbrs_use_mu_only: True
-  pbrs_k_use_mode: "tail:6"
-  #
+  pbrs_k_use_mode: "all"  # Uses k=0,1,...,ft_denoising_steps-1
+
+  # EBM model configuration
+  ebm:
+    _target_: model.ebm.EBM
+    obs_dim: ${obs_dim}
+    action_dim: ${action_dim}
+    hidden_dim: 256
+    num_layers: 4
+
+  # EBM checkpoint path (optional)
+  ebm_ckpt_path: /linting-slow-vol/EBM-Guidance/outputs/gym/ebm_best_val_walker2d-v2-medium.pt
+  # Network configuration
   network_path: ${base_policy_path}
   actor:
     _target_: model.diffusion.mlp_diffusion.DiffusionMLP
@@ -108,12 +129,7 @@ model:
     mlp_dims: [256, 256, 256]
     activation_type: Mish
     residual_style: True
-  ebm_model:
-    _target_: model.ebm.ebm.EBMWrapper
-    # EBM model configuration
-    hidden_dim: 256
-    num_layers: 3
-    activation: "relu"
+
   ft_denoising_steps: ${ft_denoising_steps}
   horizon_steps: ${horizon_steps}
   obs_dim: ${obs_dim}

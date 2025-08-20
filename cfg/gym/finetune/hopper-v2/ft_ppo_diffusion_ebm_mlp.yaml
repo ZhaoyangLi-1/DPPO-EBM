@@ -1,8 +1,10 @@
 defaults:
   - _self_
+
 hydra:
-  run:  
+  run:
     dir: ${logdir}
+
 _target_: agent.finetune.train_ppo_diffusion_ebm_agent.TrainPPODiffusionEBMAgent
 
 name: ${env_name}_ppo_diffusion_ebm_mlp_ta${horizon_steps}_td${denoising_steps}_tdf${ft_denoising_steps}
@@ -16,7 +18,7 @@ env_name: hopper-medium-v2
 obs_dim: 11
 action_dim: 3
 denoising_steps: 20
-ft_denoising_steps: 10
+ft_denoising_steps: 20
 cond_steps: 1
 horizon_steps: 4
 act_steps: 4
@@ -37,6 +39,7 @@ env:
       max_episode_steps: ${env.max_episode_steps}
       reset_within_step: True
 
+# wandb: null
 wandb:
   entity: ${oc.env:DPPO_WANDB_ENTITY}
   project: gym-${env_name}-finetune-ebm
@@ -75,6 +78,7 @@ train:
 
 model:
   _target_: model.diffusion.diffusion_ppo_ebm.PPODiffusionEBM
+
   # Standard PPO parameters
   gamma_denoising: 0.99
   clip_ploss_coef: 0.01
@@ -83,34 +87,33 @@ model:
   randn_clip_value: 3
   min_sampling_denoising_std: 0.1
   min_logprob_denoising_std: 0.1
-  
-  # Energy scaling parameters
-  use_energy_scaling: True  # Enable EnergyScalerPerK
+
+  # Energy scaling parameters (optional; not required by theory-based PBRS)
+  use_energy_scaling: True
   energy_scaling_momentum: 0.99
   energy_scaling_eps: 1e-6
   energy_scaling_use_mad: True
-  
+
   # Potential-based reward shaping parameters
-  use_pbrs: True  # Enable potential-based reward shaping
-  pbrs_lambda: 1.0  # Weight for PBRS reward
-  pbrs_beta: 1.0  # Inverse temperature parameter
-  pbrs_alpha: 1.0  # Scaling factor for potential
-  pbrs_M: 1  # Number of Monte Carlo samples
-  pbrs_eta: 0.3  # Weight decay parameter for step weighting
-  pbrs_use_mu_only: True  # Use only mean actions (faster)
-  pbrs_k_use_mode: "tail:6"  # Which denoising steps to use for PBRS
-  
+  use_ebm_reward_shaping: True
+  pbrs_lambda: 1.0
+  pbrs_beta: 1.0
+  pbrs_alpha: 1.0
+  pbrs_M: 4
+  pbrs_use_mu_only: True
+  pbrs_k_use_mode: "all"
+
   # EBM model configuration
   ebm:
-    _target_: model.ebm.example_ebm.ExampleEBM  # Replace with your EBM model
+    _target_: model.ebm.EBM
     obs_dim: ${obs_dim}
     action_dim: ${action_dim}
     hidden_dim: 256
-    num_layers: 3
-  
+    num_layers: 4
+
   # EBM checkpoint path (optional)
-  ebm_ckpt_path: ${oc.env:DPPO_LOG_DIR}/ebm_checkpoints/example_ebm.pt
-  
+  ebm_ckpt_path: /linting-slow-vol/EBM-Guidance/outputs/gym/ebm_best_val_hopper-v2-medium.pt
+
   # Network configuration
   network_path: ${base_policy_path}
   actor:
@@ -128,6 +131,7 @@ model:
     mlp_dims: [256, 256, 256]
     activation_type: Mish
     residual_style: True
+
   ft_denoising_steps: ${ft_denoising_steps}
   horizon_steps: ${horizon_steps}
   obs_dim: ${obs_dim}

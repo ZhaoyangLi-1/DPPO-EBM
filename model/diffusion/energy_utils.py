@@ -55,14 +55,22 @@ class EnergyScalerPerK:
             k_vec: Denoising step indices [B] or [B, 1]
             E_vec: Energy values corresponding to each step [B] or [B, 1]
         """
+        # Ensure both tensors have the same shape
         k = k_vec.reshape(-1).cpu()
         e = E_vec.reshape(-1).detach().cpu()
+        
+        # Check if shapes match
+        if k.size(0) != e.size(0):
+            log.warning(f"Shape mismatch in EnergyScalerPerK.update: k_vec.shape={k_vec.shape}, E_vec.shape={E_vec.shape}")
+            # Use the minimum length to avoid index errors
+            min_len = min(k.size(0), e.size(0))
+            k = k[:min_len]
+            e = e[:min_len]
         
         for kk in k.unique():
             mask = (k == kk)
             if mask.sum() == 0:
                 continue
-                
             vals = e[mask]
             # Use median for robust statistics if use_mad=True, otherwise mean
             mu = vals.median() if self.use_mad else vals.mean()
@@ -99,8 +107,8 @@ class EnergyScalerPerK:
 
     def get_stats(self, k: int) -> Dict[str, float]:
         """Get current statistics for a specific denoising step k."""
-        if k < 0 or k > self.K:
-            raise ValueError(f"k must be between 0 and {self.K}")
+        if k < 0 or k >= self.K:
+            raise ValueError(f"k must be between 0 and {self.K-1}")
         return {
             "mean": self.m[k].item(),
             "std": self.s[k].item(),
@@ -110,215 +118,206 @@ class EnergyScalerPerK:
 
 class KFreePotential:
     """
-    K-marginalized free energy potential for reward shaping.
-    
-    This class implements potential-based reward shaping using energy-based models
-    and diffusion policies. It computes potentials φ(s) using k-marginalized free energy:
-    
-    Φ_k(s) = (1/β) * log E_{a~q_k}[exp(-β * Ẽ(s,a,k))]
-    φ(s) = α * Σ_k w_k Φ_k(s)
-    
-    where q_k is the diffusion policy at denoising step k.
-    
-    Args:
-        ebm_model: Energy-based model for computing E(s,a,k)
-        pi0: Frozen diffusion policy for sampling actions
-        K: Number of denoising steps
-        stats: Normalization statistics for actions
-        k_use: List of denoising steps to use for potential computation
-        beta_k: Inverse temperature parameter (default: 1.0)
-        alpha: Scaling factor for the potential (default: 1.0)
-        M: Number of samples for Monte Carlo estimation (default: 1)
-        eta: Weight decay parameter for step weighting (default: 0.3)
-        use_mu_only: Whether to use only mean actions (faster but less accurate)
-        device: Device to use for computations
+    Path free energy potential φ(s) for PBRS, matching the theory:
+      φ(s) = (α/β) * log[ 1/(M|K|) * Σ_{m=1..M} Σ_{k∈K} exp(-β E_θ(s, a_k^(m), k)) ]
+
+    - Actions a_k^(m) are sampled from a frozen diffusion prior π₀ at denoising step k
+    - K includes denoising indices in 0..K-1 (0 is the final fully denoised step, K-1 is fully noisy)
+    - Aggregation is a pure log-mean-exp over all sampled terms (no additional weights)
     """
-    
-    def __init__(self, ebm_model: nn.Module, pi0: nn.Module, K: int, stats: Dict[str, Any],
-                 k_use: List[int], beta_k: float = 1.0, alpha: float = 1.0, M: int = 1,
-                 eta: float = 0.3, use_mu_only: bool = True, device: Optional[torch.device] = None):
-        
+
+    def __init__(
+        self,
+        ebm_model: nn.Module,
+        pi0: nn.Module,
+        K: int,
+        stats: Dict[str, Any],
+        k_use: List[int],
+        beta_k: float = 1.0,
+        alpha: float = 1.0,
+        M: int = 1,
+        use_mu_only: bool = True,
+        device: Optional[torch.device] = None,
+    ):
         self.ebm = ebm_model.eval()
         self.pi0 = pi0.eval()
-        
+
         # Freeze the prior policy parameters
         for p in self.pi0.parameters():
             p.requires_grad = False
-            
-        self.K = K
-        self.k_use = sorted(set([int(min(max(1, k), K)) for k in k_use]))
-        self.beta = beta_k
-        self.alpha = alpha
+
+        self.K = int(K)
+        # Allow k=0..K-1 (0 is fully denoised, K-1 is fully noisy)
+        self.k_use = sorted(set(int(min(max(0, k), self.K - 1)) for k in k_use))
+        
+        # Log k_use range validation
+        log.info(f"KFreePotential k_use validation: K={self.K}, k_use={self.k_use}, valid range: 0 to {self.K-1}")
+        if any(k < 0 or k >= self.K for k in self.k_use):
+            log.warning(f"Invalid k values in k_use: {[k for k in self.k_use if k < 0 or k >= self.K]}")
+        
+        self.beta = float(beta_k)
+        self.alpha = float(alpha)
         self.M = max(1, int(M))
-        self.use_mu_only = use_mu_only
+        self.use_mu_only = bool(use_mu_only)
         self.device = device or next(ebm_model.parameters()).device
-        
-        # Weight early denoising steps higher (exploration-friendly)
-        w = torch.tensor([math.exp(eta * (K - k)) for k in range(K + 1)], dtype=torch.float32)
-        self.w = (w / w.sum()).to(self.device)
-        
-        # Energy scaler for normalization
-        self.scaler = EnergyScalerPerK(K=K, momentum=0.99, use_mad=True)
+
+        # Normalization stats for actions
         self.stats = stats
 
     @torch.no_grad()
-    def _phi_k_from_actions(self, poses: torch.Tensor, views, t_idx: torch.Tensor, 
-                           k: int, A_k: torch.Tensor) -> torch.Tensor:
-        """Compute Φ_k(s) for a specific denoising step k."""
+    def _neg_beta_energy_from_actions(
+        self,
+        poses: torch.Tensor,
+        k: int,
+        A_k: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return x = -β E_θ(s, a_k, k) with action normalization to [-1, 1]."""
+        # Log k range validation (only once)
+        if not hasattr(self, '_logged_k_range'):
+            log.info(f"EBM k range validation: k={k}, K={self.K}, valid range: 0 to {self.K-1}")
+            if k < 0 or k >= self.K:
+                log.warning(f"Invalid k value: {k}, should be in range [0, {self.K-1}]")
+            self._logged_k_range = True
+        
         B = poses.size(0)
-        k_vec = torch.full((B,), int(k), dtype=torch.long, device=self.device)
-        
-        # Normalize actions using statistics
-        act_min_t = torch.tensor(self.stats["act_min"], dtype=torch.float32, device=poses.device)
-        act_max_t = torch.tensor(self.stats["act_max"], dtype=torch.float32, device=poses.device)
-        if act_min_t.ndim == 2:
-            act_min_t = act_min_t.min(dim=0).values
-        if act_max_t.ndim == 2:
-            act_max_t = act_max_t.max(dim=0).values
-        act_min_t = act_min_t.view(1, 1, -1)
-        act_max_t = act_max_t.view(1, 1, -1)
-        
-        # Normalize actions to [-1, 1] range
-        a_norm = torch.clamp((A_k - act_min_t) / (act_max_t - act_min_t + 1e-6) * 2 - 1, -1.0, 1.0)
-        
-        # Compute energy using EBM
-        E_out = self.ebm(k_idx=k_vec, views=None, poses=poses, actions=a_norm)
-        E = E_out[0] if isinstance(E_out, (tuple, list)) else E_out
-        
-        # Average over additional dimensions if present
-        if E.dim() >= 2 and E.size(0) == B:
-            E = E.mean(dim=tuple(range(1, E.dim())))
-            
-        # Update scaler and normalize energy
-        self.scaler.update(k_vec, E)
-        En = self.scaler.normalize(k_vec, E)
-        x = -self.beta * En
-        
-        return x if self.use_mu_only else (1.0 / self.beta) * x
+        k_vec = torch.full((B,), int(k), dtype=torch.long, device=poses.device)
+
+        # Ensure actions have shape [B, H, A]
+        if A_k.dim() == 2:  # [B, A]
+            A_k = A_k.unsqueeze(1)
+        elif A_k.dim() != 3:
+            log.warning(f"Unexpected A_k shape: {A_k.shape}")
+            return torch.zeros(B, device=poses.device)
+
+        # Normalize actions to [-1, 1]
+        try:
+            act_min_t = torch.tensor(self.stats["act_min"], dtype=torch.float32, device=poses.device)
+            act_max_t = torch.tensor(self.stats["act_max"], dtype=torch.float32, device=poses.device)
+            if act_min_t.ndim == 2:
+                act_min_t = act_min_t.min(dim=0).values
+            if act_max_t.ndim == 2:
+                act_max_t = act_max_t.max(dim=0).values
+            act_min_t = act_min_t.view(1, 1, -1)
+            act_max_t = act_max_t.view(1, 1, -1)
+            a_norm = torch.clamp((A_k - act_min_t) / (act_max_t - act_min_t + 1e-6) * 2 - 1, -1.0, 1.0)
+        except Exception as e:
+            log.warning(f"Action normalization failed: {e}")
+            a_norm = A_k
+
+        # Compute energy
+        try:
+            E_out = self.ebm(k_idx=k_vec, views=None, poses=poses, actions=a_norm)
+            E = E_out[0] if isinstance(E_out, (tuple, list)) else E_out
+            if E.dim() >= 2 and E.size(0) == B:
+                E = E.mean(dim=tuple(range(1, E.dim())))
+        except Exception as e:
+            log.warning(f"EBM forward failed: {e}")
+            return torch.zeros(B, device=poses.device)
+
+        return -self.beta * E
 
     @torch.no_grad()
-    def phi(self, obs_state: torch.Tensor, t_idx: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Compute the potential φ(s) for given observations.
-        
-        Args:
-            obs_state: Observation states [B, obs_dim] or [B, 1, obs_dim]
-            t_idx: Optional timestep indices [B]
-            
-        Returns:
-            Potential values [B]
-        """
-        if obs_state.dim() == 3 and obs_state.size(1) == 1:
-            poses = obs_state[:, 0, :]
+    def phi(self, obs_state: torch.Tensor) -> torch.Tensor:
+        """Compute φ(s) via log-mean-exp over sampled path energies exactly as in the theory."""
+        # Accept [B, obs] or [B, 1, obs] or [B, T_cond, obs] -> use last cond step
+        if obs_state.dim() == 3:
+            poses = obs_state[:, -1, :]
         else:
             poses = obs_state
-            
+
         B = poses.size(0)
         device = poses.device
-        Phi_list = []
-        
+        x_terms: List[torch.Tensor] = []  # each [B]
+
+        # Sample chains from frozen prior
         if self.use_mu_only or self.M == 1:
-            # Use deterministic sampling (zero noise)
-            z0 = torch.zeros((B, self.pi0.eps_model.out_shape[0], self.pi0.eps_model.out_shape[1]), device=device)
-            noise_zero = self._make_zero_noise_list(B, *self.pi0.eps_model.out_shape, self.K, device)
-            
-            _, chain = self.pi0.decode_chunk(
-                poses, z0=z0,
-                cond={"state": poses, "gamma_schedule": "const", "norm_stats": self.stats},
-                noise_list=noise_zero
-            )
-            
-            for k in self.k_use:
-                A_k = chain[:, (self.K - k)]  # Index j=K-k corresponds to a^k
-                Phi_k = self._phi_k_from_actions(
-                    poses, None, 
-                    t_idx if t_idx is not None else torch.zeros(B, dtype=torch.long, device=device), 
-                    k, A_k
-                )
-                Phi_list.append(Phi_k if self.use_mu_only else (1.0 / self.beta) * Phi_k)
-        else:
-            # Use Monte Carlo sampling
-            Xk_accum = {k: [] for k in self.k_use}
-            for m in range(self.M):
-                z0 = torch.randn((B, self.pi0.eps_model.out_shape[0], self.pi0.eps_model.out_shape[1]), device=device)
-                noise_list = self._make_randn_noise_list(B, *self.pi0.eps_model.out_shape, self.K, device)
-                
-                _, chain = self.pi0.decode_chunk(
-                    poses, z0=z0,
-                    cond={"state": poses, "gamma_schedule": "const", "norm_stats": self.stats},
-                    noise_list=noise_list
-                )
-                
+            try:
+                samples = self.pi0.forward(cond={"state": poses}, deterministic=True, return_chain=True)
+                chain = samples.chains  # [B, K+1, H, A], index -1 is final action
+                T = chain.size(1)
                 for k in self.k_use:
-                    A_k = chain[:, (self.K - k)]
-                    x_or_phi = self._phi_k_from_actions(
-                        poses, None,
-                        t_idx if t_idx is not None else torch.zeros(B, dtype=torch.long, device=device),
-                        k, A_k
-                    )
-                    Xk_accum[k].append(x_or_phi)
-                    
-            for k in self.k_use:
-                x_stack = torch.stack(Xk_accum[k], dim=1)  # [B, M]
-                Phi_k = (1.0 / self.beta) * _logmeanexp(x_stack, dim=1)
-                Phi_list.append(Phi_k)
-                
-        # Weighted combination of potentials
-        w = self.w[self.k_use]
-        w = w / w.sum()
-        P = torch.stack(Phi_list, dim=1)  # [B, len(k_use)]
-        phi = self.alpha * (P * w.view(1, -1)).sum(dim=1)
-        
-        return phi  # [B]
+                    if 0 <= k < self.K and T > 0:
+                        idx = max(0, min(T - 1, T - 1 - k))
+                        A_k = chain[:, idx]
+                        x = self._neg_beta_energy_from_actions(poses, k, A_k)  # [B]
+                        x_terms.append(x)
+            except Exception as e:
+                log.warning(f"Deterministic chain sampling failed: {e}")
+                return torch.zeros(B, device=device)
+        else:
+            try:
+                for m in range(self.M):
+                    samples = self.pi0.forward(cond={"state": poses}, deterministic=False, return_chain=True)
+                    chain = samples.chains  # [B, K+1, H, A]
+                    T = chain.size(1)
+                    for k in self.k_use:
+                        if 0 <= k < self.K and T > 0:
+                            idx = max(0, min(T - 1, T - 1 - k))
+                            A_k = chain[:, idx]
+                            x = self._neg_beta_energy_from_actions(poses, k, A_k)
+                            x_terms.append(x)
+            except Exception as e:
+                log.warning(f"Stochastic chain sampling failed: {e}")
+                return torch.zeros(B, device=device)
+
+        if len(x_terms) == 0:
+            return torch.zeros(B, device=device)
+
+        # Stack to [B, M*|K|] and apply log-mean-exp
+        X = torch.stack(x_terms, dim=1)
+        log_mean_exp = _logmeanexp(X, dim=1)  # [B]
+        return (self.alpha / self.beta) * log_mean_exp
 
     @torch.no_grad()
-    def shape_reward(self, s_t: torch.Tensor, s_tp1: torch.Tensor, gamma: float,
-                    t_t: Optional[torch.Tensor] = None, t_tp1: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Compute shaped reward using potential-based reward shaping.
-        
-        Args:
-            s_t: Current states [B, obs_dim]
-            s_tp1: Next states [B, obs_dim]
-            gamma: Discount factor
-            t_t: Current timesteps [B] (optional)
-            t_tp1: Next timesteps [B] (optional)
-            
-        Returns:
-            Shaped reward values [B]
-        """
-        phi_t = self.phi(s_t, t_t)
-        phi_tp1 = self.phi(s_tp1, t_tp1)
+    def shape_reward(self, s_t: torch.Tensor, s_tp1: torch.Tensor, gamma: float) -> torch.Tensor:
+        """r_shape = γ φ(s') - φ(s)."""
+        phi_t = self.phi(s_t)
+        phi_tp1 = self.phi(s_tp1)
         return gamma * phi_tp1 - phi_t
 
     def _make_zero_noise_list(self, B: int, H: int, A: int, K: int, device):
-        """Create list of zero noise tensors for deterministic sampling."""
         zero = torch.zeros((B, H, A), device=device)
         return [zero.clone() for _ in range(K)]
 
     def _make_randn_noise_list(self, B: int, H: int, A: int, K: int, device):
-        """Create list of random noise tensors for stochastic sampling."""
         return [torch.randn((B, H, A), device=device) for _ in range(K)]
 
 
 def build_k_use_indices(mode: str, K: int) -> List[int]:
     """
-    Build list of denoising steps to use based on mode.
+    Build list of denoising steps to use based on mode, with 0-based indexing (0..K-1).
     
-    Args:
-        mode: Mode string ('all', 'last_half', 'tail:N')
-        K: Total number of denoising steps
-        
-    Returns:
-        List of denoising step indices to use
+    k=0: completely denoised action (no noise)
+    k=K-1: fully noisy action (maximum noise)
+    
+    - "all": use all steps [0, 1, ..., K-1]
+    - "last_half": use the last half of denoising (low-noise end): [0, ..., floor((K-1)/2)]
+    - "tail:N": use the last N denoising steps near k=0: [0, 1, ..., min(N-1, K)]
     """
+    K = int(K)
+    result = None
+    
     if mode == "all":
-        return list(range(1, K + 1))
-    if mode == "last_half":
-        return list(range(max(1, K // 2), K + 1))
-    if mode.startswith("tail:"):
-        n = int(mode.split(":")[1])
+        result = list(range(0, K))  # 0 to K-1
+    elif mode == "last_half":
+        result = list(range(0, K // 2))  # 0 to (K//2)-1
+    elif mode.startswith("tail:"):
+        try:
+            n = int(mode.split(":")[1])
+        except Exception:
+            n = 6
         n = max(1, n)
-        return list(range(max(1, K - n + 1), K + 1))
-    # Default: last 6 steps
-    return list(range(max(1, K - 6 + 1), K + 1))
+        result = list(range(0, min(n, K)))  # 0 to min(n-1, K-1)
+    else:
+        # Default: tail:6
+        result = list(range(0, min(6, K)))  # 0 to min(5, K-1)
+    
+    # Log k range validation (only once per mode)
+    if not hasattr(build_k_use_indices, '_logged_modes'):
+        build_k_use_indices._logged_modes = set()
+    
+    if mode not in build_k_use_indices._logged_modes:
+        log.info(f"build_k_use_indices: mode='{mode}', K={K}, result={result}, valid range: 0 to {K-1}")
+        build_k_use_indices._logged_modes.add(mode)
+    
+    return result

@@ -18,6 +18,23 @@ from agent.finetune.train_ppo_agent import TrainPPOAgent
 from util.scheduler import CosineAnnealingWarmupRestarts
 
 
+def unravel_index(indices: torch.Tensor, shape: tuple):
+    """
+    Torch version of numpy.unravel_index (compatible with torch<2.1)
+    Args:
+        indices: Tensor of flat indices, shape (N,)
+        shape: tuple of ints, the target shape
+    Returns:
+        tuple of Tensors, each (N,) giving coordinates along each dimension
+    """
+    coords = []
+    for dim in reversed(shape):
+        coord = indices % dim
+        indices = indices // dim
+        coords.append(coord)
+    return tuple(reversed(coords))
+
+
 class TrainPPODiffusionAgent(TrainPPOAgent):
     def __init__(self, cfg):
         super().__init__(cfg)

@@ -16,7 +16,7 @@ env_name: halfcheetah-medium-v2
 obs_dim: 17
 action_dim: 6
 denoising_steps: 20
-ft_denoising_steps: 10
+ft_denoising_steps: 20
 cond_steps: 1
 horizon_steps: 4
 act_steps: 4
@@ -39,7 +39,7 @@ env:
 
 wandb:
   entity: ${oc.env:DPPO_WANDB_ENTITY}
-  project: gym-${env_name}-finetune
+  project: gym-${env_name}-finetune-ebm
   run: ${now:%H-%M-%S}_${name}
 
 train:

@@ -40,7 +40,8 @@ class TrainSACDiffusionEBMAgent(TrainAgent):
         self.gamma = cfg.train.gamma
         self.tau = cfg.train.tau
         self.alpha = cfg.train.alpha
-        self.automatic_entropy_tuning = cfg.train.automatic_entropy_tuning
+        # Support both keys: automatic_entropy_tuning (preferred) and auto_alpha (legacy)
+        self.automatic_entropy_tuning = getattr(cfg.train, "automatic_entropy_tuning", getattr(cfg.train, "auto_alpha", True))
         self.target_entropy = cfg.train.target_entropy
         
         # EBM parameters
@@ -390,16 +391,15 @@ class TrainSACDiffusionEBMAgent(TrainAgent):
         v_loss.backward()
         self.critic_v_optimizer.step()
         
-        # Update actor
-        with torch.no_grad():
-            # Sample actions from current policy for actor loss
-            cond = {"state": obs_batch}
-            samples = self.model.forward(cond, deterministic=False)
-            actions_policy = samples.trajectories[:, 0]  # Take first action
-            
-            # Approximate log probabilities (simplified)
-            log_probs = torch.zeros(actions_policy.size(0), device=self.device)
+        # Update actor (ensure gradients flow into the actor by sampling without no_grad)
+        # Sample actions from current policy for actor loss
+        cond = {"state": obs_batch}
+        samples = self.model.forward(cond, deterministic=False)
+        actions_policy = samples.trajectories[:, 0]  # Take first action
         
+        # Approximate log probabilities (kept as zeros; acts as no-entropy SAC/DPG)
+        log_probs = torch.zeros(actions_policy.size(0), device=self.device)
+
         actor_loss = self.model.compute_actor_loss(obs_batch, actions_policy, log_probs)
         
         self.actor_optimizer.zero_grad()
@@ -408,10 +408,14 @@ class TrainSACDiffusionEBMAgent(TrainAgent):
         
         # Update alpha if automatic entropy tuning is enabled
         if self.automatic_entropy_tuning:
-            alpha_loss = self.model.compute_alpha_loss(obs_batch, actions_policy, log_probs)
-            self.alpha_optimizer.zero_grad()
-            alpha_loss.backward()
-            self.model.update_alpha(self.alpha_optimizer)
+            # If log_probs are zeros (no-entropy variant), skip alpha update to avoid collapsing alpha->0
+            if torch.allclose(log_probs, torch.zeros_like(log_probs)):
+                alpha_loss = torch.tensor(0.0, device=self.device)
+            else:
+                alpha_loss = self.model.compute_alpha_loss(obs_batch, actions_policy, log_probs)
+                self.alpha_optimizer.zero_grad()
+                alpha_loss.backward()
+                self.model.update_alpha(self.alpha_optimizer)
         
         # Log losses
         if self.use_wandb and self.itr % self.log_freq == 0:
