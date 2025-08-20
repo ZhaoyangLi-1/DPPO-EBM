@@ -11,7 +11,12 @@ import logging
 from typing import Optional, Dict, Any
 
 log = logging.getLogger(__name__)
-from model.diffusion.diffusion import DiffusionModel
+from model.diffusion.diffusion import DiffusionModel, Sample
+from model.diffusion.sampling import (
+    extract,
+    cosine_beta_schedule,
+    make_timesteps,
+)
 
 
 class SACDiffusion(DiffusionModel):
@@ -43,7 +48,12 @@ class SACDiffusion(DiffusionModel):
         device: str = "cuda:0",
         **kwargs,
     ):
-        super().__init__(**kwargs)
+        # Initialize nn.Module base without invoking DiffusionModel.__init__
+        # We intentionally avoid calling DiffusionModel.__init__ because SACDiffusion manages its own actor/critic modules
+        nn.Module.__init__(self)
+        
+        # Do not call DiffusionModel.__init__ here; SACDiffusion manages its own actor/critics
+        self.device = device
         
         # SAC parameters
         self.gamma = gamma
@@ -58,13 +68,43 @@ class SACDiffusion(DiffusionModel):
         self.horizon_steps = horizon_steps
         self.obs_dim = obs_dim
         self.action_dim = action_dim
-        self.device = device
+        # Sampling hyperparameters
+        self.denoised_clip_value = 1.0
+        self.final_action_clip_value = None
+        self.randn_clip_value = 10.0
+        self.predict_epsilon = True
         
         # Networks
         self.actor = actor.to(device)
         self.critic_q1 = critic_q1.to(device)
         self.critic_q2 = critic_q2.to(device)
         self.critic_v = critic_v.to(device)
+
+        # Precompute DDPM schedules for sampling
+        self.betas = cosine_beta_schedule(self.denoising_steps).to(device)
+        self.alphas = 1.0 - self.betas
+        self.alphas_cumprod = torch.cumprod(self.alphas, axis=0)
+        self.alphas_cumprod_prev = torch.cat(
+            [torch.ones(1).to(device), self.alphas_cumprod[:-1]]
+        )
+        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
+        self.sqrt_recip_alphas_cumprod = torch.sqrt(1.0 / self.alphas_cumprod)
+        self.sqrt_recipm1_alphas_cumprod = torch.sqrt(1.0 / self.alphas_cumprod - 1)
+        self.ddpm_var = (
+            self.betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+        )
+        self.ddpm_logvar_clipped = torch.log(torch.clamp(self.ddpm_var, min=1e-20))
+        self.ddpm_mu_coef1 = (
+            self.betas
+            * torch.sqrt(self.alphas_cumprod_prev)
+            / (1.0 - self.alphas_cumprod)
+        )
+        self.ddpm_mu_coef2 = (
+            (1.0 - self.alphas_cumprod_prev)
+            * torch.sqrt(self.alphas)
+            / (1.0 - self.alphas_cumprod)
+        )
         
         # Target networks
         self.critic_q1_target = copy.deepcopy(critic_q1).to(device)
@@ -88,19 +128,67 @@ class SACDiffusion(DiffusionModel):
         
         log.info(f"Initialized SAC with alpha={self.alpha}, target_entropy={self.target_entropy}")
     
+    @torch.no_grad()
     def forward(self, cond: Dict[str, torch.Tensor], deterministic: bool = False, return_chain: bool = False):
         """
-        Forward pass through the actor network.
-        
-        Args:
-            cond: Conditioning dictionary containing observations
-            deterministic: Whether to use deterministic sampling
-            return_chain: Whether to return the full denoising chain
-            
-        Returns:
-            Action samples and optional denoising chain
+        DDPM sampling using the actor network as the epsilon/x0 predictor.
+        Returns a Sample with fields trajectories and chains (optional).
         """
-        return self.actor.forward(cond, deterministic=deterministic, return_chain=return_chain)
+        device = self.betas.device
+        sample_data = cond["state"] if "state" in cond else cond["rgb"]
+        B = len(sample_data)
+
+        x = torch.randn((B, self.horizon_steps, self.action_dim), device=device)
+        chains = None
+        if return_chain:
+            chains = torch.zeros(
+                (B, self.denoising_steps + 1, self.horizon_steps, self.action_dim),
+                device=device,
+            )
+            chains[:, 0] = x
+
+        for i, t in enumerate(reversed(range(self.denoising_steps))):
+            t_b = make_timesteps(B, t, device)
+            # Network predicts epsilon by default
+            pred = self.actor(x, t_b, cond=cond)
+
+            # Predict x0
+            if self.predict_epsilon:
+                x_recon = (
+                    extract(self.sqrt_recip_alphas_cumprod, t_b, x.shape) * x
+                    - extract(self.sqrt_recipm1_alphas_cumprod, t_b, x.shape) * pred
+                )
+            else:
+                x_recon = pred
+
+            if self.denoised_clip_value is not None:
+                x_recon = x_recon.clamp(-self.denoised_clip_value, self.denoised_clip_value)
+
+            # μ and σ^2
+            mu = (
+                extract(self.ddpm_mu_coef1, t_b, x.shape) * x_recon
+                + extract(self.ddpm_mu_coef2, t_b, x.shape) * x
+            )
+            logvar = extract(self.ddpm_logvar_clipped, t_b, x.shape)
+            std = torch.exp(0.5 * logvar)
+
+            # Determine noise level
+            if deterministic or t == 0:
+                std = torch.zeros_like(std)
+            else:
+                std = torch.clip(std, min=1e-3)
+
+            noise = torch.randn_like(x).clamp_(-self.randn_clip_value, self.randn_clip_value)
+            x = mu + std * noise
+
+            # clamp action at final step
+            if self.final_action_clip_value is not None and i == self.denoising_steps - 1:
+                x = torch.clamp(x, -self.final_action_clip_value, self.final_action_clip_value)
+
+            if return_chain:
+                chains[:, i + 1] = x
+
+        return Sample(x, chains)
     
     def compute_q_values(self, obs: torch.Tensor, actions: torch.Tensor) -> tuple:
         """
@@ -113,8 +201,10 @@ class SACDiffusion(DiffusionModel):
         Returns:
             Tuple of (q1_values, q2_values) [B]
         """
-        q1 = self.critic_q1(obs, actions)
-        q2 = self.critic_q2(obs, actions)
+        # Critics expect cond dict format
+        cond = {"state": obs}
+        q1 = self.critic_q1(cond, actions)
+        q2 = self.critic_q2(cond, actions)
         return q1, q2
     
     def compute_v_value(self, obs: torch.Tensor) -> torch.Tensor:
@@ -127,7 +217,9 @@ class SACDiffusion(DiffusionModel):
         Returns:
             V-values [B]
         """
-        return self.critic_v(obs)
+        # Critic expects cond dict format
+        cond = {"state": obs}
+        return self.critic_v(cond)
     
     def compute_target_q_values(self, obs: torch.Tensor, actions: torch.Tensor) -> tuple:
         """
@@ -140,8 +232,10 @@ class SACDiffusion(DiffusionModel):
         Returns:
             Tuple of (target_q1_values, target_q2_values) [B]
         """
-        q1_target = self.critic_q1_target(obs, actions)
-        q2_target = self.critic_q2_target(obs, actions)
+        # Critics expect cond dict format
+        cond = {"state": obs}
+        q1_target = self.critic_q1_target(cond, actions)
+        q2_target = self.critic_q2_target(cond, actions)
         return q1_target, q2_target
     
     def compute_target_v_value(self, obs: torch.Tensor) -> torch.Tensor:
@@ -154,7 +248,9 @@ class SACDiffusion(DiffusionModel):
         Returns:
             Target V-values [B]
         """
-        return self.critic_v_target(obs)
+        # Critic expects cond dict format
+        cond = {"state": obs}
+        return self.critic_v_target(cond)
     
     def update_target_networks(self):
         """Update target networks using soft update."""
@@ -204,7 +300,7 @@ class SACDiffusion(DiffusionModel):
         with torch.no_grad():
             # Sample next actions from current policy
             next_cond = {"state": next_obs}
-            next_samples = self.actor.forward(next_cond, deterministic=False)
+            next_samples = self.forward(next_cond, deterministic=False)
             next_actions = next_samples.trajectories[:, 0]  # Take first action
             
             # Compute next log probs (approximate)

@@ -247,7 +247,7 @@ class TrainSACDiffusionAgent(TrainAgent):
                             "success rate - eval": success_rate,
                             "avg episode reward - eval": avg_episode_reward,
                             "num episode - eval": num_episode_finished,
-                        }, step=self.itr, commit=False)
+                        }, step=self.itr, commit=True)
                     run_results[-1]["eval_success_rate"] = success_rate
                     run_results[-1]["eval_episode_reward"] = avg_episode_reward
                 else:
@@ -331,4 +331,4 @@ class TrainSACDiffusionAgent(TrainAgent):
                 "loss/v": v_loss.item(),
                 "loss/actor": actor_loss.item(),
                 "loss/alpha": alpha_loss.item() if self.automatic_entropy_tuning else 0.0,
-            }, step=self.itr, commit=False)
+            }, step=self.itr, commit=True)

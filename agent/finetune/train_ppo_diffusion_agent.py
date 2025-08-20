@@ -461,7 +461,7 @@ class TrainPPODiffusionAgent(TrainPPOAgent):
                                 "num episode - eval": num_episode_finished,
                             },
                             step=self.itr,
-                            commit=False,
+                            commit=True,
                         )
                     run_results[-1]["eval_success_rate"] = success_rate
                     run_results[-1]["eval_episode_reward"] = avg_episode_reward
@@ -487,9 +487,7 @@ class TrainPPODiffusionAgent(TrainPPOAgent):
                                 "num episode - train": num_episode_finished,
                                 "diffusion - min sampling std": diffusion_min_sampling_std,
                                 "actor lr": self.actor_optimizer.param_groups[0]["lr"],
-                                "critic lr": self.critic_optimizer.param_groups[0][
-                                    "lr"
-                                ],
+                                "critic lr": self.critic_optimizer.param_groups[0]["lr"],
                             },
                             step=self.itr,
                             commit=True,

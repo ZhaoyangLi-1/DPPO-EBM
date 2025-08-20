@@ -32,6 +32,7 @@ class SACDiffusionEBM(SACDiffusion):
         target_entropy: Optional[float] = None,
         # EBM reward shaping parameters
         use_ebm_reward_shaping: bool = False,
+        ebm: Optional[nn.Module] = None,
         ebm_model: Optional[nn.Module] = None,
         ebm_ckpt_path: Optional[str] = None,
         pbrs_lambda: float = 1.0,
@@ -71,22 +72,31 @@ class SACDiffusionEBM(SACDiffusion):
         self.energy_scaling_eps = energy_scaling_eps
         self.energy_scaling_use_mad = energy_scaling_use_mad
         
-        # Initialize EBM and potential function if enabled
+        # Initialize EBM reference and potential function if enabled
+        self.ebm_model = None
         if self.use_ebm_reward_shaping:
-            if ebm_model is None:
-                raise ValueError("EBM model must be provided when use_ebm_reward_shaping=True")
-            
-            self.ebm_model = ebm_model
+            # Accept either `ebm_model` or alias `ebm` from config
+            self.ebm_model = ebm_model if ebm_model is not None else ebm
+            # Move EBM to the same device as the diffusion model
+            if self.ebm_model is not None:
+                self.ebm_model = self.ebm_model.to(self.device)
+                self.ebm_model.eval()
             if ebm_ckpt_path is not None:
                 checkpoint = torch.load(ebm_ckpt_path, map_location=self.device)
-                self.ebm_model.load_state_dict(checkpoint.get("model", checkpoint), strict=False)
-                log.info(f"Loaded EBM from {ebm_ckpt_path}")
+                if self.ebm_model is not None:
+                    self.ebm_model.load_state_dict(checkpoint.get("model", checkpoint), strict=False)
+                    log.info(f"Loaded EBM from {ebm_ckpt_path}")
+                else:
+                    log.warning("EBM checkpoint provided but no EBM model instance; will load later if set.")
             
             # Build k_use indices for potential computation
             self.pbrs_k_use = build_k_use_indices(self.pbrs_k_use_mode, self.ft_denoising_steps)
             
             # Log k_use validation
             log.info(f"SACDiffusionEBM initialization: ft_denoising_steps={self.ft_denoising_steps}, pbrs_k_use={self.pbrs_k_use}, valid range: 0 to {self.ft_denoising_steps-1}")
+            
+            if self.ebm_model is None:
+                log.warning("use_ebm_reward_shaping=True but no EBM model provided at init; expecting caller to set self.ebm_model before setup_potential_function().")
         
         # Initialize potential function (will be set up in setup_potential_function)
         self.potential_function = None
@@ -106,10 +116,17 @@ class SACDiffusionEBM(SACDiffusion):
             
         self.stats = stats
         
-        # Create a frozen copy of the current policy as prior
-        pi0 = self.actor.eval()
-        for p in pi0.parameters():
-            p.requires_grad = False
+        # Create a lightweight wrapper that exposes forward(cond, deterministic, return_chain)
+        # using the current model's sampling API. No parameters are registered, so this stays frozen by design.
+        class _PolicySampler(nn.Module):
+            def __init__(self, outer):
+                super().__init__()
+                self.outer = outer
+            @torch.no_grad()
+            def forward(self, cond: Dict[str, torch.Tensor], deterministic: bool = True, return_chain: bool = True):
+                return self.outer.forward(cond=cond, deterministic=deterministic, return_chain=return_chain)
+
+        pi0 = _PolicySampler(self).eval()
         
         # Setup potential function
         self.potential_function = KFreePotential(

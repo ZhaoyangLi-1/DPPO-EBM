@@ -914,7 +914,7 @@ class TrainPPODiffusionEBMAgent(TrainPPODiffusionAgent):
                                 "num episode - eval": num_episode_finished,
                             },
                             step=self.itr,
-                            commit=False,
+                            commit=True,
                         )
                     run_results[-1]["eval_success_rate"] = success_rate
                     run_results[-1]["eval_episode_reward"] = avg_episode_reward

@@ -222,7 +222,9 @@ class TrainSACDiffusionEBMAgent(TrainAgent):
                 done_venv = terminated_venv | truncated_venv
                 
                 # Store trajectory data
-                obs_trajs["state"][step] = prev_obs_venv["state"]
+                # prev_obs_venv["state"] has shape (n_envs, cond_steps, obs_dim) due to multi-step wrapper
+                # We need to take the last observation from the history
+                obs_trajs["state"][step] = prev_obs_venv["state"][:, -1]  # Shape: (n_envs, obs_dim)
                 action_trajs[step] = action_venv[:, 0]  # Store first action
                 reward_trajs[step] = reward_venv
                 done_trajs[step] = done_venv
@@ -338,7 +340,7 @@ class TrainSACDiffusionEBMAgent(TrainAgent):
                             "avg episode reward - eval": avg_episode_reward,
                             "avg PBR reward - eval": avg_pbrs_reward,
                             "num episode - eval": num_episode_finished,
-                        }, step=self.itr, commit=False)
+                        }, step=self.itr, commit=True)
                     run_results[-1]["eval_success_rate"] = success_rate
                     run_results[-1]["eval_episode_reward"] = avg_episode_reward
                     run_results[-1]["eval_pbr_reward"] = avg_pbrs_reward
@@ -425,7 +427,7 @@ class TrainSACDiffusionEBMAgent(TrainAgent):
                 "loss/v": v_loss.item(),
                 "loss/actor": actor_loss.item(),
                 "loss/alpha": alpha_loss.item() if self.automatic_entropy_tuning else 0.0,
-            }, step=self.itr, commit=False)
+            }, step=self.itr, commit=True)
 
 
 # Import hydra for configuration instantiation

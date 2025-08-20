@@ -98,12 +98,13 @@ model:
 
   # Potential-based reward shaping parameters
   use_ebm_reward_shaping: True
-  pbrs_lambda: 0.5
+  pbrs_lambda: 1.0
   pbrs_beta: 1.0
-  pbrs_alpha: 0.1
+  pbrs_alpha: 1.0
   pbrs_M: 4
   pbrs_use_mu_only: True
-  pbrs_k_use_mode: "tail:6"
+  pbrs_k_use_mode: "all"
+
 
   # EBM model configuration
   ebm:
