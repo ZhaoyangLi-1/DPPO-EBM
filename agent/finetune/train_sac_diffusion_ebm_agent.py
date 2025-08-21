@@ -1,75 +1,55 @@
 """
-Soft Actor-Critic (SAC) with Energy-Based Model integration for diffusion policy training.
+SAC training loop for diffusion policy actor with EBM integration.
 
-This module extends the standard SAC training with energy-based model capabilities,
-including potential-based reward shaping.
+Differences vs TrainSACDiffusionAgent:
+  - Replace actor's log pi with -E_psi(s,a) in actor objective (handled by model).
+  - Optional potential-based reward shaping applied at rollout using KFreePotential.
+  - Optional per-k energy normalization (EnergyScalerPerK) handled here if needed.
 """
 
 import os
 import pickle
-import einops
 import numpy as np
 import torch
-import torch.nn as nn
 import logging
 import wandb
-import math
-import copy
-from typing import Dict, Any, Optional, List
 from collections import deque
+from copy import deepcopy
+
+from agent.finetune.train_agent import TrainAgent
+from util.timer import Timer
+from util.scheduler import CosineAnnealingWarmupRestarts
+from model.diffusion.energy_utils import KFreePotential, build_k_use_indices, EnergyScalerPerK
 
 log = logging.getLogger(__name__)
-from util.timer import Timer
-from agent.finetune.train_agent import TrainAgent
-from model.diffusion.diffusion_sac_ebm import SACDiffusionEBM
-from model.diffusion.energy_utils import build_k_use_indices
 
 
 class TrainSACDiffusionEBMAgent(TrainAgent):
-    """
-    Enhanced SAC training agent with Energy-Based Model integration.
-    
-    This class extends the standard SAC training with potential-based reward shaping
-    using energy-based models.
-    """
-    
+
     def __init__(self, cfg):
         super().__init__(cfg)
-        
-        # SAC parameters
+
+        # SAC hyperparams
         self.gamma = cfg.train.gamma
         self.tau = cfg.train.tau
-        self.alpha = cfg.train.alpha
-        # Support both keys: automatic_entropy_tuning (preferred) and auto_alpha (legacy)
-        self.automatic_entropy_tuning = getattr(cfg.train, "automatic_entropy_tuning", getattr(cfg.train, "auto_alpha", True))
-        self.target_entropy = cfg.train.target_entropy
-        
-        # EBM parameters
-        self.use_ebm_reward_shaping = cfg.model.use_ebm_reward_shaping
-        self.ebm_config = {
-            "lambda": cfg.model.pbrs_lambda,
-            "beta": cfg.model.pbrs_beta,
-            "alpha": cfg.model.pbrs_alpha,
-            "M": cfg.model.pbrs_M,
-            "use_mu_only": cfg.model.pbrs_use_mu_only,
-            "k_use_mode": cfg.model.pbrs_k_use_mode,
-        }
-        
-        # Initialize EBM model if enabled
-        self.ebm_model = None
-        if self.use_ebm_reward_shaping:
-            self.ebm_model = hydra.utils.instantiate(cfg.model.ebm)
-            if hasattr(cfg.model, 'ebm_ckpt_path') and cfg.model.ebm_ckpt_path:
-                checkpoint = torch.load(cfg.model.ebm_ckpt_path, map_location=self.device)
-                self.ebm_model.load_state_dict(checkpoint.get("model", checkpoint), strict=False)
-                log.info(f"Loaded EBM from {cfg.model.ebm_ckpt_path}")
-        
+
         # Optimizers
         self.actor_optimizer = torch.optim.AdamW(
-            self.model.actor.parameters(),
+            self.model.actor_ft.parameters(),
             lr=cfg.train.actor_lr,
             weight_decay=cfg.train.actor_weight_decay,
         )
+        self.actor_lr_scheduler = None
+        if "actor_lr_scheduler" in cfg.train:
+            self.actor_lr_scheduler = CosineAnnealingWarmupRestarts(
+                self.actor_optimizer,
+                first_cycle_steps=cfg.train.actor_lr_scheduler.first_cycle_steps,
+                cycle_mult=1.0,
+                max_lr=cfg.train.actor_lr,
+                min_lr=cfg.train.actor_lr_scheduler.min_lr,
+                warmup_steps=cfg.train.actor_lr_scheduler.warmup_steps,
+                gamma=1.0,
+            )
         self.critic_q1_optimizer = torch.optim.AdamW(
             self.model.critic_q1.parameters(),
             lr=cfg.train.critic_lr,
@@ -85,52 +65,83 @@ class TrainSACDiffusionEBMAgent(TrainAgent):
             lr=cfg.train.critic_lr,
             weight_decay=cfg.train.critic_weight_decay,
         )
-        
-        # Alpha optimizer for entropy tuning
-        if self.automatic_entropy_tuning:
-            self.alpha_optimizer = torch.optim.Adam(
-                [self.model.log_alpha],
-                lr=cfg.train.critic_lr,
-            )
-        
-        # Buffer parameters
+
+        # Buffer
         self.buffer_size = cfg.train.buffer_size
         self.batch_size = cfg.train.batch_size
         self.replay_ratio = cfg.train.replay_ratio
-        
-        # Update frequencies
-        self.critic_update_freq = int(self.batch_size / self.replay_ratio)
-        self.actor_update_freq = int(self.batch_size / self.replay_ratio)
-        
-        # Evaluation parameters
-        self.n_eval_episode = cfg.train.n_eval_episode
-        self.n_explore_steps = cfg.train.n_explore_steps
-        
-        # Setup potential function if EBM is enabled
-        if self.use_ebm_reward_shaping:
-            self._setup_potential_function(cfg)
-        
-        log.info(f"Initialized SAC EBM agent with buffer_size={self.buffer_size}, batch_size={self.batch_size}")
-    
-    def _setup_potential_function(self, cfg):
-        """Set up the potential function for reward shaping."""
-        if not self.use_ebm_reward_shaping or self.ebm_model is None:
-            return
 
-        # Load normalization statistics
-        normalization_path = cfg.env.wrappers.mujoco_locomotion_lowdim.normalization_path
+        # Temperature
+        self.automatic_entropy_tuning = cfg.train.automatic_entropy_tuning
+        self.target_entropy = cfg.train.target_entropy
+        if self.automatic_entropy_tuning:
+            init_alpha = cfg.train.alpha
+            self.log_alpha = torch.tensor(np.log(init_alpha), device=self.device, requires_grad=True)
+            self.log_alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=cfg.train.critic_lr)
+        else:
+            self.log_alpha = torch.tensor(np.log(cfg.train.alpha), device=self.device, requires_grad=False)
+
+        # Exploration/eval
+        self.n_explore_steps = cfg.train.n_explore_steps
+        self.n_eval_episode = cfg.train.n_eval_episode
+
+        # EBM reward shaping configuration
+        self.use_ebm_reward_shaping = cfg.model.get("use_ebm_reward_shaping", False)
+        self.pbrs_lambda = cfg.model.get("pbrs_lambda", 1.0)
+        self.pbrs_beta = cfg.model.get("pbrs_beta", 1.0)
+        self.pbrs_alpha = cfg.model.get("pbrs_alpha", 1.0)
+        self.pbrs_M = cfg.model.get("pbrs_M", 1)
+        self.pbrs_use_mu_only = cfg.model.get("pbrs_use_mu_only", True)
+        self.pbrs_k_use_mode = cfg.model.get("pbrs_k_use_mode", "tail:6")
+
+        # Attach EBM to model if provided by Hydra config
+        if hasattr(cfg.model, "ebm") and cfg.model.ebm is not None:
+            from hydra.utils import instantiate
+            ebm_model = instantiate(cfg.model.ebm)
+            ebm_ckpt_path = cfg.model.get("ebm_ckpt_path", None)
+            if hasattr(self.model, "set_ebm"):
+                self.model.set_ebm(ebm_model, ebm_ckpt_path)
+            else:
+                self.model.ebm_model = ebm_model
+                if ebm_ckpt_path is not None:
+                    state = torch.load(ebm_ckpt_path, map_location=self.device)
+                    self.model.ebm_model.load_state_dict(state.get("model", state), strict=False)
+                for p in self.model.ebm_model.parameters():
+                    p.requires_grad = False
+
+        # Load normalization stats and provide to model for energy inputs
+        normalization_path = self.cfg.env.wrappers.mujoco_locomotion_lowdim.normalization_path
         stats = self._load_normalization_stats(normalization_path)
-        
-        # Wire the instantiated EBM into the model if not already set
-        self.model.ebm_model = self.ebm_model.to(self.device).eval()
-        
-        # Setup potential function in the model
-        self.model.setup_potential_function(stats)
-        
-        log.info("Setup potential function for EBM reward shaping")
-    
+        if hasattr(self.model, "setup_action_norm_stats"):
+            self.model.setup_action_norm_stats(stats)
+        self._stats = stats
+
+        # PBRS potential
+        self.potential = None
+        if self.use_ebm_reward_shaping and getattr(self.model, "ebm_model", None) is not None:
+            pi0 = deepcopy(self.model).eval()
+            for p in pi0.parameters():
+                p.requires_grad = False
+            K = self.model.ft_denoising_steps
+            k_use = build_k_use_indices(self.pbrs_k_use_mode, K)
+            self.potential = KFreePotential(
+                ebm_model=self.model.ebm_model,
+                pi0=pi0,
+                K=K,
+                stats=stats,
+                k_use=k_use,
+                beta_k=self.pbrs_beta,
+                alpha=self.pbrs_alpha,
+                M=self.pbrs_M,
+                use_mu_only=self.pbrs_use_mu_only,
+                device=self.device,
+            )
+            log.info(f"Initialized PBRS with k_use={k_use}")
+
+        # Reward scaling
+        self.scale_reward_factor = cfg.train.get("scale_reward_factor", 1.0)
+
     def _load_normalization_stats(self, normalization_path):
-        """Load normalization statistics from file."""
         if normalization_path.endswith(".npz"):
             data = np.load(normalization_path)
             return {
@@ -140,129 +151,77 @@ class TrainSACDiffusionEBMAgent(TrainAgent):
                 "act_max": data["action_max"],
             }
         elif normalization_path.endswith(".pkl"):
+            import pickle as pkl
             with open(normalization_path, "rb") as f:
-                return pickle.load(f)
+                return pkl.load(f)
         else:
             raise ValueError(f"Unsupported normalization file format: {normalization_path}")
-    
+
     def run(self):
-        """Main training loop."""
-        # Initialize replay buffer
         obs_buffer = deque(maxlen=self.buffer_size)
         next_obs_buffer = deque(maxlen=self.buffer_size)
         action_buffer = deque(maxlen=self.buffer_size)
         reward_buffer = deque(maxlen=self.buffer_size)
-        done_buffer = deque(maxlen=self.buffer_size)
-        
-        # Training loop
+        terminated_buffer = deque(maxlen=self.buffer_size)
+
         timer = Timer()
         run_results = []
         cnt_train_step = 0
         done_venv = np.zeros((1, self.n_envs))
-        
+
         while self.itr < self.n_train_itr:
-            if self.itr % 1000 == 0:
-                print(f"Finished training iteration {self.itr} of {self.n_train_itr}")
-            
-            # Prepare video paths for rendering
-            options_venv = [{} for _ in range(self.n_envs)]
-            if self.itr % self.render_freq == 0 and self.render_video:
-                for env_ind in range(self.n_render):
-                    options_venv[env_ind]["video_path"] = os.path.join(
-                        self.render_dir, f"itr-{self.itr}_trial-{env_ind}.mp4"
-                    )
-            
-            # Define train or eval mode
-            eval_mode = (
-                self.itr % self.val_freq == 0
-                and self.itr > self.n_explore_steps
-                and not self.force_train
-            )
-            
-            # Initialize episode data
-            obs_trajs = {"state": np.zeros((self.n_steps, self.n_envs, self.obs_dim))}
-            action_trajs = np.zeros((self.n_steps, self.n_envs, self.action_dim))
-            reward_trajs = np.zeros((self.n_steps, self.n_envs))
-            pbrs_reward_trajs = np.zeros((self.n_steps, self.n_envs))  # EBM reward shaping
-            done_trajs = np.zeros((self.n_steps, self.n_envs))
+            eval_mode = self.itr % self.val_freq == 0 and self.itr >= self.n_explore_steps and not self.force_train
+            self.model.eval() if eval_mode else self.model.train()
+
             firsts_trajs = np.zeros((self.n_steps + 1, self.n_envs))
-            
-            # Reset environments
-            obs_venv = self.venv.reset()
-            firsts_trajs[0] = 1
-            prev_obs_venv = obs_venv
-            
-            # Collect trajectories
+            if self.reset_at_iteration or eval_mode or self.itr == 0:
+                prev_obs_venv = self.reset_env_all(options_venv=[{} for _ in range(self.n_envs)])
+                firsts_trajs[0] = 1
+            else:
+                firsts_trajs[0] = done_venv
+
+            reward_trajs = np.zeros((self.n_steps, self.n_envs))
+
             for step in range(self.n_steps):
-                if step % 10 == 0:
-                    print(f"Processed step {step} of {self.n_steps}")
-                
-                # Sample actions using diffusion model
-                with torch.no_grad():
-                    cond = {
-                        "state": torch.from_numpy(prev_obs_venv["state"])
-                        .float()
-                        .to(self.device)
-                    }
-                    samples = self.model.forward(
-                        cond=cond,
-                        deterministic=eval_mode,
-                        return_chain=True,
-                    )
-                    output_venv = samples.trajectories.cpu().numpy()
-                    chains_venv = samples.chains.cpu().numpy()
-                
-                action_venv = output_venv[:, :self.act_steps]
-                
-                # Apply multi-step action
-                (
-                    obs_venv,
-                    reward_venv,
-                    terminated_venv,
-                    truncated_venv,
-                    info_venv,
-                ) = self.venv.step(action_venv)
-                done_venv = terminated_venv | truncated_venv
-                
-                # Store trajectory data
-                # prev_obs_venv["state"] has shape (n_envs, cond_steps, obs_dim) due to multi-step wrapper
-                # We need to take the last observation from the history
-                obs_trajs["state"][step] = prev_obs_venv["state"][:, -1]  # Shape: (n_envs, obs_dim)
-                action_trajs[step] = action_venv[:, 0]  # Store first action
-                reward_trajs[step] = reward_venv
-                done_trajs[step] = done_venv
-                firsts_trajs[step + 1] = done_venv
-                
-                # Compute EBM reward shaping if enabled
-                if self.use_ebm_reward_shaping:
-                    try:
-                        # Convert observations to tensors for potential computation
-                        obs_t_tensor = torch.from_numpy(prev_obs_venv["state"][:, -1]).float().to(self.device)
-                        obs_tp1_tensor = torch.from_numpy(obs_venv["state"][:, -1]).float().to(self.device)
-                        
-                        # Compute shaped reward: r_shape = γ * φ(s_{t+1}) - φ(s_t)
-                        shaped_reward = self.model.compute_shaped_reward(obs_t_tensor, obs_tp1_tensor)
-                        
-                        # Scale by lambda and add to environment reward
-                        pbrs_reward = self.ebm_config["lambda"] * shaped_reward.cpu().numpy()
-                        pbrs_reward_trajs[step] = pbrs_reward
-                        
-                        # Add shaped reward to environment reward for training
-                        reward_venv += pbrs_reward
-                        reward_trajs[step] = reward_venv
-                        
-                    except Exception as e:
-                        log.warning(f"Error in EBM reward shaping at step {step}: {e}")
-                        pbrs_reward_trajs[step] = np.zeros(self.n_envs)
+                # Select action
+                if self.itr < self.n_explore_steps:
+                    action_venv = self.venv.action_space.sample()
                 else:
-                    reward_trajs[step] = reward_venv
-                    pbrs_reward_trajs[step] = np.zeros(self.n_envs)
-                
-                # Update for next step
+                    with torch.no_grad():
+                        cond = {"state": torch.from_numpy(prev_obs_venv["state"]).float().to(self.device)}
+                        samples = self.model(cond=cond, deterministic=eval_mode, return_chain=False)
+                        output_venv = samples.trajectories.cpu().numpy()
+                        action_venv = output_venv[:, : self.act_steps]
+
+                # Step env
+                obs_venv, reward_venv, terminated_venv, truncated_venv, info_venv = self.venv.step(action_venv)
+                done_venv = terminated_venv | truncated_venv
+
+                # PBRS at rollout
+                if self.potential is not None:
+                    with torch.no_grad():
+                        s_t = torch.from_numpy(prev_obs_venv["state"]).float().to(self.device)
+                        s_tp1 = torch.from_numpy(obs_venv["state"]).float().to(self.device)
+                        r_shape = self.potential.shape_reward(s_t, s_tp1, self.gamma).cpu().numpy()
+                    reward_venv = reward_venv + self.pbrs_lambda * r_shape
+
+                reward_trajs[step] = reward_venv
+                firsts_trajs[step + 1] = done_venv
+
+                # Buffer add
+                if not eval_mode:
+                    for i in range(self.n_envs):
+                        obs_buffer.append(prev_obs_venv["state"][i])
+                        next_obs = info_venv[i]["final_obs"]["state"] if truncated_venv[i] else obs_venv["state"][i]
+                        next_obs_buffer.append(next_obs)
+                        action_buffer.append(action_venv[i])
+                    reward_buffer.extend((reward_venv * self.scale_reward_factor).tolist())
+                    terminated_buffer.extend(terminated_venv.tolist())
+
                 prev_obs_venv = obs_venv
                 cnt_train_step += self.n_envs * self.act_steps if not eval_mode else 0
-            
-            # Summarize episode rewards
+
+            # Summarize episode reward for eval/report
             episodes_start_end = []
             for env_ind in range(self.n_envs):
                 env_steps = np.where(firsts_trajs[:, env_ind] == 1)[0]
@@ -271,166 +230,172 @@ class TrainSACDiffusionEBMAgent(TrainAgent):
                     end = env_steps[i + 1]
                     if end - start > 1:
                         episodes_start_end.append((env_ind, start, end - 1))
-            
             if len(episodes_start_end) > 0:
                 reward_trajs_split = [
-                    reward_trajs[start:end + 1, env_ind]
+                    reward_trajs[start : end + 1, env_ind]
                     for env_ind, start, end in episodes_start_end
                 ]
-                pbrs_reward_trajs_split = [
-                    pbrs_reward_trajs[start:end + 1, env_ind]
-                    for env_ind, start, end in episodes_start_end
-                ]
-                
                 num_episode_finished = len(reward_trajs_split)
-                episode_reward = np.array([np.sum(reward_traj) for reward_traj in reward_trajs_split])
-                pbrs_episode_reward = np.array([np.sum(pbrs_traj) for pbrs_traj in pbrs_reward_trajs_split])
-                
-                avg_episode_reward = np.mean(episode_reward)
-                avg_pbrs_reward = np.mean(pbrs_episode_reward)
-                success_rate = np.mean(
-                    episode_reward >= self.best_reward_threshold_for_success
+                episode_reward = np.array(
+                    [np.sum(reward_traj) for reward_traj in reward_trajs_split]
+                )
+                episode_best_reward = np.array(
+                    [
+                        np.max(reward_traj) / self.act_steps
+                        for reward_traj in reward_trajs_split
+                    ]
+                )
+                avg_episode_reward = float(np.mean(episode_reward))
+                avg_best_reward = float(np.mean(episode_best_reward))
+                success_rate = float(
+                    np.mean(
+                        episode_best_reward >= self.best_reward_threshold_for_success
+                    )
                 )
             else:
-                episode_reward = np.array([])
-                pbrs_episode_reward = np.array([])
                 num_episode_finished = 0
-                avg_episode_reward = 0
-                avg_pbrs_reward = 0
-                success_rate = 0
-                log.info("[WARNING] No episode completed within the iteration!")
-            
-            # Update models if not in eval mode
-            if not eval_mode:
-                # Store data in replay buffer
-                for step in range(self.n_steps):
-                    for env_ind in range(self.n_envs):
-                        if not done_trajs[step, env_ind]:
-                            obs_buffer.append(obs_trajs["state"][step, env_ind])
-                            next_obs_buffer.append(obs_trajs["state"][min(step + 1, self.n_steps - 1), env_ind])
-                            action_buffer.append(action_trajs[step, env_ind])
-                            reward_buffer.append(reward_trajs[step, env_ind])
-                            done_buffer.append(done_trajs[step, env_ind])
-                
-                # Update networks if buffer has enough samples
-                if len(obs_buffer) >= self.batch_size:
-                    self._update_networks(obs_buffer, next_obs_buffer, action_buffer, reward_buffer, done_buffer)
-            
-            # Update target networks
-            self.model.update_target_networks()
-            
-            # Save model
+                avg_episode_reward = 0.0
+                avg_best_reward = 0.0
+                success_rate = 0.0
+
+            # Updates
+            if not eval_mode and self.itr >= self.n_explore_steps:
+                num_batch = int(self.n_steps * self.n_envs / self.batch_size * self.replay_ratio)
+
+                obs_array = np.array(obs_buffer)
+                next_obs_array = np.array(next_obs_buffer)
+                action_array = np.array(action_buffer)
+                reward_array = np.array(reward_buffer)
+                terminated_array = np.array(terminated_buffer)
+
+                # Accumulate metrics
+                last_loss_q = None
+                last_loss_v = None
+                last_loss_pi = None
+                last_loss_alpha = None
+
+                for _ in range(max(1, num_batch)):
+                    inds = np.random.choice(len(obs_array), self.batch_size)
+                    obs_b = torch.from_numpy(obs_array[inds]).float().to(self.device)
+                    next_obs_b = torch.from_numpy(next_obs_array[inds]).float().to(self.device)
+                    actions_b = torch.from_numpy(action_array[inds]).float().to(self.device)
+                    rewards_b = torch.from_numpy(reward_array[inds]).float().to(self.device)
+                    terminated_b = torch.from_numpy(terminated_array[inds]).float().to(self.device)
+
+                    obs_b = {"state": obs_b}
+                    next_obs_b = {"state": next_obs_b}
+
+                    # Critic Q update
+                    loss_q = self.model.loss_critic(obs_b, next_obs_b, actions_b, rewards_b, terminated_b, self.gamma)
+                    self.critic_q1_optimizer.zero_grad(); self.critic_q2_optimizer.zero_grad()
+                    loss_q.backward()
+                    self.critic_q1_optimizer.step(); self.critic_q2_optimizer.step()
+                    last_loss_q = float(loss_q.detach().item())
+
+                    # Value update
+                    alpha = self.log_alpha.exp().item()
+                    loss_v = self.model.loss_value(obs_b, alpha)
+                    self.critic_v_optimizer.zero_grad(); loss_v.backward(); self.critic_v_optimizer.step()
+                    last_loss_v = float(loss_v.detach().item())
+
+                    # Actor update (uses EBM internally)
+                    self.actor_optimizer.zero_grad()
+                    loss_pi = self.model.loss_actor(obs_b, alpha)
+                    loss_pi.backward(); self.actor_optimizer.step()
+                    last_loss_pi = float(loss_pi.detach().item())
+
+                    # Temperature update
+                    if self.automatic_entropy_tuning:
+                        self.log_alpha_optimizer.zero_grad()
+                        loss_alpha = self.model.loss_temperature(obs_b, self.log_alpha.exp(), self.target_entropy)
+                        loss_alpha.backward(); self.log_alpha_optimizer.step()
+                        last_loss_alpha = float(loss_alpha.detach().item())
+
+                    # Target update
+                    self.model.update_target_value(self.tau)
+
+            # LR
+            if self.actor_lr_scheduler is not None:
+                self.actor_lr_scheduler.step()
+
+            # Save
             if self.itr % self.save_model_freq == 0 or self.itr == self.n_train_itr - 1:
                 self.save_model()
-            
-            # Log results
-            run_results.append({
-                "itr": self.itr,
-                "step": cnt_train_step,
-            })
-            
+
+            # Log
+            run_results.append({"itr": self.itr, "step": cnt_train_step})
             if self.itr % self.log_freq == 0:
                 time = timer()
-                run_results[-1]["time"] = time
-                
                 if eval_mode:
                     log.info(
-                        f"eval: success rate {success_rate:8.4f} | avg episode reward {avg_episode_reward:8.4f} | avg PBR reward {avg_pbrs_reward:8.4f}"
+                        f"eval: success rate {success_rate:8.4f} | avg episode reward {avg_episode_reward:8.4f} | avg best reward {avg_best_reward:8.4f}"
                     )
                     if self.use_wandb:
-                        wandb.log({
-                            "success rate - eval": success_rate,
-                            "avg episode reward - eval": avg_episode_reward,
-                            "avg PBR reward - eval": avg_pbrs_reward,
-                            "num episode - eval": num_episode_finished,
-                        }, step=self.itr, commit=True)
-                    run_results[-1]["eval_success_rate"] = success_rate
-                    run_results[-1]["eval_episode_reward"] = avg_episode_reward
-                    run_results[-1]["eval_pbr_reward"] = avg_pbrs_reward
+                        wandb.log(
+                            {
+                                "success rate - eval": success_rate,
+                                "avg episode reward - eval": avg_episode_reward,
+                                "avg best reward - eval": avg_best_reward,
+                                "num episode - eval": num_episode_finished,
+                            },
+                            step=self.itr,
+                            commit=True,
+                        )
                 else:
-                    log.info(
-                        f"{self.itr}: step {cnt_train_step:8d} | reward {avg_episode_reward:8.4f} | PBR {avg_pbrs_reward:8.4f} | t:{time:8.4f}"
-                    )
+                    # Diagnostics for Q/V/E and shaped reward
+                    diag = {}
+                    if self.itr >= self.n_explore_steps and len(obs_buffer) >= self.batch_size:
+                        inds = np.random.choice(len(obs_array), self.batch_size)
+                        obs_b = torch.from_numpy(obs_array[inds]).float().to(self.device)
+                        next_obs_b = torch.from_numpy(next_obs_array[inds]).float().to(self.device)
+                        obs_diag = {"state": obs_b}
+                        next_obs_diag = {"state": next_obs_b}
+                        with torch.no_grad():
+                            actions_d, chains_d = self.model._sample_action_and_chain(obs_diag, deterministic=False)
+                            q1_d = self.model.critic_q1(obs_diag, actions_d).view(-1)
+                            q2_d = self.model.critic_q2(obs_diag, actions_d).view(-1)
+                            v_d = self.model.critic_v(obs_diag).view(-1)
+                            target_v_d = self.model.target_v(next_obs_diag).view(-1)
+                            if getattr(self.model, "ebm_model", None) is not None:
+                                E_d = self.model._compute_energy(obs_diag, actions_d)
+                                diag["energy mean"] = float(E_d.mean().item())
+                                diag["energy std"] = float(E_d.std().item())
+                            if self.potential is not None:
+                                r_shape_d = self.potential.shape_reward(obs_b, next_obs_b, self.gamma)
+                                diag["pbrs mean"] = float(r_shape_d.mean().item())
+                                diag["pbrs std"] = float(r_shape_d.std().item())
+                        diag.update({
+                            "q1 mean": float(q1_d.mean().item()),
+                            "q2 mean": float(q2_d.mean().item()),
+                            "v mean": float(v_d.mean().item()),
+                            "v_target mean": float(target_v_d.mean().item()),
+                        })
+
+                    alpha_val = float(self.log_alpha.exp().item())
+                    line = f"{self.itr}: step {cnt_train_step:8d} | reward {avg_episode_reward:8.4f} | alpha {alpha_val:8.4f} | t:{time:8.4f}"
+                    if self.itr >= self.n_explore_steps and last_loss_q is not None:
+                        line += f" | loss_q {last_loss_q:8.4f} | loss_v {last_loss_v:8.4f} | loss_pi {last_loss_pi:8.4f}"
+                        if last_loss_alpha is not None:
+                            line += f" | loss_alpha {last_loss_alpha:8.4f}"
+                    log.info(line)
                     if self.use_wandb:
-                        wandb.log({
+                        payload = {
                             "total env step": cnt_train_step,
                             "avg episode reward - train": avg_episode_reward,
-                            "avg PBR reward - train": avg_pbrs_reward,
-                            "num episode - train": num_episode_finished,
-                            "alpha": self.model.get_alpha().item(),
-                        }, step=self.itr, commit=True)
-                    run_results[-1]["train_episode_reward"] = avg_episode_reward
-                    run_results[-1]["train_pbr_reward"] = avg_pbrs_reward
-                
-                with open(self.result_path, "wb") as f:
-                    pickle.dump(run_results, f)
-            
+                            "entropy coeff": alpha_val,
+                            "buffer size": len(obs_buffer),
+                        }
+                        if self.itr >= self.n_explore_steps and last_loss_q is not None:
+                            payload.update({
+                                "loss - critic": last_loss_q,
+                                "loss - value": last_loss_v,
+                                "loss - actor": last_loss_pi,
+                            })
+                            if last_loss_alpha is not None:
+                                payload["loss - alpha"] = last_loss_alpha
+                        payload.update(diag)
+                        wandb.log(payload, step=self.itr, commit=True)
+
             self.itr += 1
-    
-    def _update_networks(self, obs_buffer, next_obs_buffer, action_buffer, reward_buffer, done_buffer):
-        """Update SAC networks."""
-        # Sample batch from replay buffer
-        batch_size = min(self.batch_size, len(obs_buffer))
-        indices = np.random.choice(len(obs_buffer), batch_size, replace=False)
-        
-        obs_batch = torch.from_numpy(np.array([obs_buffer[i] for i in indices])).float().to(self.device)
-        next_obs_batch = torch.from_numpy(np.array([next_obs_buffer[i] for i in indices])).float().to(self.device)
-        action_batch = torch.from_numpy(np.array([action_buffer[i] for i in indices])).float().to(self.device)
-        reward_batch = torch.from_numpy(np.array([reward_buffer[i] for i in indices])).float().to(self.device)
-        done_batch = torch.from_numpy(np.array([done_buffer[i] for i in indices])).float().to(self.device)
-        
-        # Update critics
-        q1_loss, q2_loss, v_loss = self.model.compute_critic_loss(
-            obs_batch, action_batch, reward_batch, next_obs_batch, done_batch
-        )
-        
-        self.critic_q1_optimizer.zero_grad()
-        q1_loss.backward()
-        self.critic_q1_optimizer.step()
-        
-        self.critic_q2_optimizer.zero_grad()
-        q2_loss.backward()
-        self.critic_q2_optimizer.step()
-        
-        self.critic_v_optimizer.zero_grad()
-        v_loss.backward()
-        self.critic_v_optimizer.step()
-        
-        # Update actor (ensure gradients flow into the actor by sampling without no_grad)
-        # Sample actions from current policy for actor loss
-        cond = {"state": obs_batch}
-        samples = self.model.forward(cond, deterministic=False)
-        actions_policy = samples.trajectories[:, 0]  # Take first action
-        
-        # Approximate log probabilities (kept as zeros; acts as no-entropy SAC/DPG)
-        log_probs = torch.zeros(actions_policy.size(0), device=self.device)
-
-        actor_loss = self.model.compute_actor_loss(obs_batch, actions_policy, log_probs)
-        
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
-        
-        # Update alpha if automatic entropy tuning is enabled
-        alpha_loss = torch.tensor(0.0, device=self.device)  # Initialize for logging
-        if self.automatic_entropy_tuning:
-            # Use EBM surrogate log-prob for alpha tuning (allow gradients for alpha update)
-            ebm_log_probs = self.model.ebm_surrogate_log_prob(obs_batch, samples.trajectories, k=0, allow_grad=True)
-            alpha_loss = self.model.compute_alpha_loss(obs_batch, samples.trajectories[:, 0], ebm_log_probs)
-            self.alpha_optimizer.zero_grad()
-            alpha_loss.backward()
-            self.model.update_alpha(self.alpha_optimizer)
-        
-        # Log losses
-        if self.use_wandb and self.itr % self.log_freq == 0:
-            wandb.log({
-                "loss/q1": q1_loss.item(),
-                "loss/q2": q2_loss.item(),
-                "loss/v": v_loss.item(),
-                "loss/actor": actor_loss.item(),
-                "loss/alpha": alpha_loss.item(),
-            }, step=self.itr, commit=True)
 
 
-# Import hydra for configuration instantiation
-import hydra

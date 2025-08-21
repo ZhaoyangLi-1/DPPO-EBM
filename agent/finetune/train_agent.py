@@ -97,6 +97,9 @@ class TrainAgent:
 
         # Logging, rendering, checkpoints
         self.logdir = cfg.logdir
+        # Ensure base log directory exists before creating subdirectories or files
+        if self.logdir is not None and len(self.logdir) > 0:
+            os.makedirs(self.logdir, exist_ok=True)
         self.render_dir = os.path.join(self.logdir, "render")
         self.checkpoint_dir = os.path.join(self.logdir, "checkpoint")
         self.result_path = os.path.join(self.logdir, "result.pkl")
