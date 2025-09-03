@@ -1,0 +1,118 @@
+defaults:
+  - _self_
+
+hydra:
+  run:
+    dir: ${logdir}
+
+_target_: agent.finetune.train_simple_mlp_ppo_agent.TrainSimpleMLP_PPOAgent
+
+name: ${env_name}_simple_mlp_ppo_env_ta${horizon_steps}
+logdir: ${oc.env:DPPO_LOG_DIR,${hydra:runtime.cwd}/log}/gym-finetune/${name}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
+
+seed: 42
+device: cuda:0
+env_name: halfcheetah-medium-v2
+obs_dim: 17
+action_dim: 6
+cond_steps: 1
+horizon_steps: 4
+act_steps: 4
+
+env:
+  n_envs: 40
+  name: ${env_name}
+  max_episode_steps: 1000
+  reset_at_iteration: False
+  save_video: False
+  best_reward_threshold_for_success: 5000
+  wrappers:
+    mujoco_locomotion_lowdim:
+      normalization_path: ${oc.env:DPPO_DATA_DIR,${hydra:runtime.cwd}/data}/gym/${env_name}/normalization.npz
+    multi_step:
+      n_obs_steps: ${cond_steps}
+      n_action_steps: ${act_steps}
+      max_episode_steps: ${env.max_episode_steps}
+      reset_within_step: True
+
+wandb:
+  entity: ${oc.env:DPPO_WANDB_ENTITY}
+  project: gym-${env_name}-finetune-simple-ppo
+  run: ${name}_SimpleMLP_PPO_Env
+  group: ${oc.env:WANDB_GROUP,${env_name}-simple-ppo-baseline}
+  tags: [SimpleMLP, PPO, Env_Reward]
+
+train:
+  n_train_itr: 200
+  n_critic_warmup_itr: 0
+  n_steps: 500
+  gamma: 0.99
+  actor_lr: 3e-4
+  actor_weight_decay: 0
+  actor_lr_scheduler:
+    first_cycle_steps: 1000
+    warmup_steps: 10
+    min_lr: 3e-4
+  critic_lr: 1e-3
+  critic_weight_decay: 0
+  critic_lr_scheduler:
+    first_cycle_steps: 1000
+    warmup_steps: 10
+    min_lr: 1e-3
+  save_model_freq: 50
+  val_freq: 10
+  render:
+    freq: 50
+    num: 0
+  reward_scale_running: True
+  reward_scale_const: 1.0
+  gae_lambda: 0.95
+  batch_size: 10000
+  update_epochs: 10
+  vf_coef: 0.5
+  target_kl: 0.015
+
+model:
+  _target_: model.rl.simple_mlp_ppo.SimpleMLP_PPO
+  clip_ploss_coef: 0.2
+  clip_vloss_coef: 0.2
+  norm_adv: True
+  use_ebm_reward: False
+  ebm_reward_scale: 1.0
+  ebm_reward_clip_max: 10.0
+  
+  ebm:
+    embed_dim: 256
+    nhead: 8
+    depth: 4
+    dropout: 0.0
+    use_cls_token: False
+    num_views: null
+  
+  actor:
+    _target_: model.common.mlp_gaussian.Gaussian_MLP
+    action_dim: ${action_dim}
+    horizon_steps: ${horizon_steps}
+    cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
+    mlp_dims: [256, 256, 256]
+    activation_type: ReLU
+    tanh_output: True
+    residual_style: False
+    use_layernorm: False
+    dropout: 0.1
+    fixed_std: null
+    learn_fixed_std: False
+    std_min: 0.01
+    std_max: 1.0
+    
+  critic:
+    _target_: model.common.critic.CriticObs
+    cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
+    mlp_dims: [256, 256, 256]
+    activation_type: ReLU
+    residual_style: False
+
+  horizon_steps: ${horizon_steps}
+  obs_dim: ${obs_dim}
+  action_dim: ${action_dim}
+  device: ${device}

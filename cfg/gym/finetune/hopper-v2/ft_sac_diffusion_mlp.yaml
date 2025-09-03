@@ -8,9 +8,9 @@ hydra:
 _target_: agent.finetune.train_sac_diffusion_agent.TrainSACDiffusionAgent
 
 name: ${env_name}_sac_diffusion_mlp_ta${horizon_steps}_td${denoising_steps}_tdf${ft_denoising_steps}
-logdir: ${oc.env:DPPO_LOG_DIR}/gym-finetune/${name}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
-base_policy_path: ${oc.env:DPPO_LOG_DIR}/gym-pretrain/hopper-medium-v2_pre_diffusion_mlp_ta4_td20/2024-06-12_23-10-05/checkpoint/state_3000.pt
-normalization_path: ${oc.env:DPPO_DATA_DIR}/gym/${env_name}/normalization.npz
+logdir: ${oc.env:DPPO_LOG_DIR,${hydra:runtime.cwd}/log}/gym-finetune/${name}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
+base_policy_path: ${oc.env:DPPO_LOG_DIR,${hydra:runtime.cwd}/log}/gym-pretrain/hopper-medium-v2_pre_diffusion_mlp_ta4_td20/2024-06-12_23-10-05/checkpoint/state_3000.pt
+normalization_path: ${oc.env:DPPO_DATA_DIR,${hydra:runtime.cwd}/data}/gym/${env_name}/normalization.npz
 
 seed: 42
 device: cuda:0
@@ -42,9 +42,11 @@ env:
 
 # wandb: null
 wandb:
-  entity: ${oc.env:DPPO_WANDB_ENTITY}
-  project: gym-${env_name}-finetune-sac
-  run: ${now:%H-%M-%S}_${name}
+  entity: ${oc.env:WANDB_ENTITY,${oc.env:DPPO_WANDB_ENTITY,null}}
+  project: ${oc.env:WANDB_PROJECT,gym-${env_name}-finetune-sac}
+  run: ${name}_sac # ${now:%H-%M-%S}_${name}
+  group: ${oc.env:WANDB_GROUP,${env_name}-sac-vs-ebm}
+  tags: [SAC]
 
 train:
   n_train_itr: 1000
@@ -53,24 +55,28 @@ train:
   
   # SAC parameters
   tau: 0.005
-  alpha: 0.2
-  automatic_entropy_tuning: True
-  target_entropy: -3  # -action_dim
+  alpha: 0.2  
+  automatic_entropy_tuning: False
+  target_entropy: -3.8  # aligned with current logpi scale for debug
   
   # Learning rates
   actor_lr: 1e-4
   actor_weight_decay: 0
-  critic_lr: 1e-3
+  critic_lr: 5e-4
   critic_weight_decay: 0
+  actor_lr_scheduler:
+    first_cycle_steps: 200
+    warmup_steps: 50
+    min_lr: 1e-5
   
   # Buffer and batch parameters
   buffer_size: 100000
-  batch_size: 256
-  replay_ratio: 1
+  batch_size: 1024
+  replay_ratio: 4
   
   # Evaluation parameters
   n_eval_episode: 10
-  n_explore_steps: 1000
+  n_explore_steps: 10
   
   # Logging and saving
   save_model_freq: 100
@@ -88,7 +94,7 @@ model:
   tau: 0.005
   alpha: 0.2
   automatic_entropy_tuning: True
-  target_entropy: -3
+  target_entropy: -2
 
   # Network configuration
   network_path: ${base_policy_path}
@@ -107,8 +113,9 @@ model:
   # Critic networks (Q-functions)
   critic_q1:
     _target_: model.common.critic.CriticObsAct
-    cond_dim: ${obs_dim}
+    cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
     action_dim: ${action_dim}
+    action_steps: ${act_steps}
     mlp_dims: [256, 256, 256]
     activation_type: Mish
     residual_style: True
@@ -116,8 +123,9 @@ model:
   
   critic_q2:
     _target_: model.common.critic.CriticObsAct
-    cond_dim: ${obs_dim}
+    cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
     action_dim: ${action_dim}
+    action_steps: ${act_steps}
     mlp_dims: [256, 256, 256]
     activation_type: Mish
     residual_style: True

@@ -19,7 +19,7 @@ from copy import deepcopy
 from agent.finetune.train_agent import TrainAgent
 from util.timer import Timer
 from util.scheduler import CosineAnnealingWarmupRestarts
-from model.diffusion.energy_utils import KFreePotential, build_k_use_indices, EnergyScalerPerK
+from model.diffusion.energy_utils import EnergyScalerPerK
 
 log = logging.getLogger(__name__)
 
@@ -85,14 +85,15 @@ class TrainSACDiffusionEBMAgent(TrainAgent):
         self.n_explore_steps = cfg.train.n_explore_steps
         self.n_eval_episode = cfg.train.n_eval_episode
 
-        # EBM reward shaping configuration
-        self.use_ebm_reward_shaping = cfg.model.get("use_ebm_reward_shaping", False)
-        self.pbrs_lambda = cfg.model.get("pbrs_lambda", 1.0)
-        self.pbrs_beta = cfg.model.get("pbrs_beta", 1.0)
-        self.pbrs_alpha = cfg.model.get("pbrs_alpha", 1.0)
-        self.pbrs_M = cfg.model.get("pbrs_M", 1)
-        self.pbrs_use_mu_only = cfg.model.get("pbrs_use_mu_only", True)
-        self.pbrs_k_use_mode = cfg.model.get("pbrs_k_use_mode", "tail:6")
+        # EBM scalar reward replacement configuration
+        self.use_ebm_reward = cfg.model.get("use_ebm_reward", False)
+        self.ebm_reward_mode = cfg.model.get("ebm_reward_mode", "k0")  # "k0" or "dense"
+        self.ebm_reward_clip_u_max = cfg.model.get("ebm_reward_clip_u_max", 5.0)
+        self.ebm_reward_use_mad = cfg.model.get("ebm_reward_use_mad", True)
+        self.ebm_reward_lambda = cfg.model.get("ebm_reward_lambda", 1.0)
+        self.ebm_reward_lambda_per_k = cfg.model.get("ebm_reward_lambda_per_k", None)
+        self.ebm_reward_baseline_M = cfg.model.get("ebm_reward_baseline_M", 4)
+        self.ebm_reward_baseline_use_mu_only = cfg.model.get("ebm_reward_baseline_use_mu_only", False)
 
         # Attach EBM to model if provided by Hydra config
         if hasattr(cfg.model, "ebm") and cfg.model.ebm is not None:
@@ -116,30 +117,32 @@ class TrainSACDiffusionEBMAgent(TrainAgent):
             self.model.setup_action_norm_stats(stats)
         self._stats = stats
 
-        # PBRS potential
-        self.potential = None
-        if self.use_ebm_reward_shaping and getattr(self.model, "ebm_model", None) is not None:
-            pi0 = deepcopy(self.model).eval()
-            for p in pi0.parameters():
-                p.requires_grad = False
-            K = self.model.ft_denoising_steps
-            k_use = build_k_use_indices(self.pbrs_k_use_mode, K)
-            self.potential = KFreePotential(
-                ebm_model=self.model.ebm_model,
-                pi0=pi0,
-                K=K,
-                stats=stats,
-                k_use=k_use,
-                beta_k=self.pbrs_beta,
-                alpha=self.pbrs_alpha,
-                M=self.pbrs_M,
-                use_mu_only=self.pbrs_use_mu_only,
-                device=self.device,
-            )
-            log.info(f"Initialized PBRS with k_use={k_use}")
+        # Macro time index per environment (episode-relative t_idx)
+        self._macro_t_idx = np.zeros((self.n_envs,), dtype=np.int64)
+
+        # No PBRS shaping: keep only EBM reward replacement
 
         # Reward scaling
         self.scale_reward_factor = cfg.train.get("scale_reward_factor", 1.0)
+
+        # ------------------------------------------------------------------
+        # Optional: EBM reward calibration state (per-k scaler + frozen BC)
+        # ------------------------------------------------------------------
+        self._reward_scaler = None
+        self._pi0_for_reward = None
+        if self.use_ebm_reward and getattr(self.model, "ebm_model", None) is not None:
+            from model.diffusion.energy_utils import EnergyScalerPerK
+            K = self.model.ft_denoising_steps
+            self._reward_scaler = EnergyScalerPerK(
+                K=K,
+                momentum=cfg.model.get("energy_scaling_momentum", 0.99),
+                eps=cfg.model.get("energy_scaling_eps", 1e-6),
+                use_mad=self.ebm_reward_use_mad,
+            )
+            self._pi0_for_reward = deepcopy(self.model).eval()
+            for p in self._pi0_for_reward.parameters():
+                p.requires_grad = False
+            log.info("Initialized SAC EBM reward calibration modules")
 
     def _load_normalization_stats(self, normalization_path):
         if normalization_path.endswith(".npz"):
@@ -177,19 +180,24 @@ class TrainSACDiffusionEBMAgent(TrainAgent):
             if self.reset_at_iteration or eval_mode or self.itr == 0:
                 prev_obs_venv = self.reset_env_all(options_venv=[{} for _ in range(self.n_envs)])
                 firsts_trajs[0] = 1
+                # reset macro t_idx at episode starts
+                self._macro_t_idx[:] = 0
             else:
                 firsts_trajs[0] = done_venv
 
             reward_trajs = np.zeros((self.n_steps, self.n_envs))
+            env_reward_trajs = np.zeros((self.n_steps, self.n_envs))
 
             for step in range(self.n_steps):
+                if step % 10 == 0:
+                    print(f"Processed step {step} of {self.n_steps}")
                 # Select action
                 if self.itr < self.n_explore_steps:
                     action_venv = self.venv.action_space.sample()
                 else:
                     with torch.no_grad():
                         cond = {"state": torch.from_numpy(prev_obs_venv["state"]).float().to(self.device)}
-                        samples = self.model(cond=cond, deterministic=eval_mode, return_chain=False)
+                        samples = self.model(cond=cond, deterministic=eval_mode, return_chain=True)
                         output_venv = samples.trajectories.cpu().numpy()
                         action_venv = output_venv[:, : self.act_steps]
 
@@ -197,14 +205,98 @@ class TrainSACDiffusionEBMAgent(TrainAgent):
                 obs_venv, reward_venv, terminated_venv, truncated_venv, info_venv = self.venv.step(action_venv)
                 done_venv = terminated_venv | truncated_venv
 
-                # PBRS at rollout
-                if self.potential is not None:
+                # Replace env reward with calibrated EBM utility if enabled
+                if self.use_ebm_reward and getattr(self.model, "ebm_model", None) is not None:
+                    # Build obs tensor and generate current chain and BC baseline chain
                     with torch.no_grad():
                         s_t = torch.from_numpy(prev_obs_venv["state"]).float().to(self.device)
-                        s_tp1 = torch.from_numpy(obs_venv["state"]).float().to(self.device)
-                        r_shape = self.potential.shape_reward(s_t, s_tp1, self.gamma).cpu().numpy()
-                    reward_venv = reward_venv + self.pbrs_lambda * r_shape
+                        cond = {"state": s_t}
+                        # Current actions (deterministic=False for exploration)
+                        samples_cur = self.model(cond=cond, deterministic=eval_mode, return_chain=True)
+                        chains_cur = samples_cur.chains  # [n_env, K+1, H, A]
+                        # Baseline from frozen BC
+                        samples_bc = self._pi0_for_reward(cond=cond, deterministic=True, return_chain=True)
+                        chains_bc = samples_bc.chains
 
+                        # Normalize and compute energies per k
+                        act_min = torch.tensor(self._stats["act_min"], dtype=torch.float32, device=self.device)
+                        act_max = torch.tensor(self._stats["act_max"], dtype=torch.float32, device=self.device)
+                        if act_min.ndim == 2:
+                            act_min = act_min.min(dim=0).values
+                        if act_max.ndim == 2:
+                            act_max = act_max.max(dim=0).values
+                        # Match [B, H, A]
+                        act_min = act_min.view(1, 1, -1)
+                        act_max = act_max.view(1, 1, -1)
+
+                        # Build macro t_idx tensor per env (episode-relative)
+                        t_vec = torch.from_numpy(self._macro_t_idx).to(self.device).long()
+                        # print(f"t_vec: {t_vec}")
+
+                        def energies_per_k(chains):
+                            B, Kp1, H, A = chains.shape
+                            E = torch.zeros(B, Kp1, device=self.device)
+                            for k in range(Kp1):
+                                # Map k=0 to the final (fully denoised) action
+                                idx = Kp1 - 1 - k
+                                actions_k = chains[:, idx]
+                                actions_norm = torch.clamp((actions_k - act_min) / (act_max - act_min + 1e-6) * 2 - 1, -1.0, 1.0)
+                                # Guard: ensure 3D [B,H,A]
+                                if actions_norm.dim() == 4:
+                                    actions_norm = actions_norm[:, idx]
+                                k_vec = torch.full((B,), k, dtype=torch.long, device=self.device)
+                                poses = s_t[:, -1, :] if s_t.dim() == 3 else s_t
+                                E_out = self.model.ebm_model(k_idx=k_vec, t_idx=t_vec, views=None, poses=poses, actions=actions_norm)
+                                e = E_out[0] if isinstance(E_out, (tuple, list)) else E_out
+                                if e.dim() >= 2 and e.size(0) == B:
+                                    e = e.mean(dim=tuple(range(1, e.dim())))
+                                E[:, k] = e
+                            return E
+
+                        E_cur = energies_per_k(chains_cur)
+                        # Robust baseline over M samples
+                        E_base_list = []
+                        M = max(1, int(self.ebm_reward_baseline_M))
+                        for m in range(M):
+                            det = bool(self.ebm_reward_baseline_use_mu_only)
+                            samples_bc_m = self._pi0_for_reward(cond={"state": s_t}, deterministic=det, return_chain=True)
+                            chains_bc_m = samples_bc_m.chains
+                            E_base_list.append(energies_per_k(chains_bc_m).unsqueeze(0))
+                        E_base = torch.cat(E_base_list, dim=0).median(dim=0).values
+
+                        # Update scaler on baseline energies and compute utilities
+                        B, Kp1 = E_cur.shape
+                        for k in range(Kp1):
+                            k_vec = torch.full((B,), k, dtype=torch.long)
+                            self._reward_scaler.update(k_vec, E_base[:, k].detach().cpu())
+
+                        s_vec = self._reward_scaler.s.to(self.device)
+                        u = torch.zeros(B, Kp1, device=self.device)
+                        eps = 1e-6
+                        for k in range(Kp1):
+                            tau_k = torch.clamp(s_vec[k], min=1e-3)
+                            u[:, k] = -(E_cur[:, k] - E_base[:, k]) / (tau_k + eps)
+                            u[:, k] = torch.clamp(u[:, k], -float(self.ebm_reward_clip_u_max), float(self.ebm_reward_clip_u_max))
+
+                        if self.ebm_reward_mode == "dense":
+                            if isinstance(self.ebm_reward_lambda_per_k, (list, tuple)):
+                                lam = torch.tensor(list(self.ebm_reward_lambda_per_k)[:Kp1], dtype=torch.float32, device=self.device)
+                                if lam.numel() < Kp1:
+                                    lam = torch.nn.functional.pad(lam, (0, Kp1 - lam.numel()), value=float(self.ebm_reward_lambda))
+                            else:
+                                lam = torch.full((Kp1,), float(self.ebm_reward_lambda), device=self.device)
+                            gamma_dn = float(getattr(self.model, "gamma_denoising", 1.0))
+                            w = torch.tensor([gamma_dn ** k for k in range(Kp1)], dtype=torch.float32, device=self.device)
+                            ebm_rew = (u * lam.view(1, -1) * w.view(1, -1)).sum(dim=1)
+                        else:
+                            ebm_rew = u[:, 0]
+                        # Log raw env reward separately for fair comparison
+                        env_reward_trajs[step] = reward_venv
+                        reward_venv = ebm_rew.detach().cpu().numpy()
+
+                # Store rewards
+                if not (self.use_ebm_reward and getattr(self.model, "ebm_model", None) is not None):
+                    env_reward_trajs[step] = reward_venv
                 reward_trajs[step] = reward_venv
                 firsts_trajs[step + 1] = done_venv
 
@@ -218,10 +310,14 @@ class TrainSACDiffusionEBMAgent(TrainAgent):
                     reward_buffer.extend((reward_venv * self.scale_reward_factor).tolist())
                     terminated_buffer.extend(terminated_venv.tolist())
 
+                # Update macro t_idx per env: increment, and reset to 0 on done
+                self._macro_t_idx += 1
+                self._macro_t_idx[done_venv.astype(bool)] = 0
+
                 prev_obs_venv = obs_venv
                 cnt_train_step += self.n_envs * self.act_steps if not eval_mode else 0
 
-            # Summarize episode reward for eval/report
+            # Summarize episode reward --- only count episodes that finish within the iteration.
             episodes_start_end = []
             for env_ind in range(self.n_envs):
                 env_steps = np.where(firsts_trajs[:, env_ind] == 1)[0]
@@ -235,9 +331,16 @@ class TrainSACDiffusionEBMAgent(TrainAgent):
                     reward_trajs[start : end + 1, env_ind]
                     for env_ind, start, end in episodes_start_end
                 ]
+                env_reward_trajs_split = [
+                    env_reward_trajs[start : end + 1, env_ind]
+                    for env_ind, start, end in episodes_start_end
+                ]
                 num_episode_finished = len(reward_trajs_split)
                 episode_reward = np.array(
                     [np.sum(reward_traj) for reward_traj in reward_trajs_split]
+                )
+                env_episode_reward = np.array(
+                    [np.sum(reward_traj) for reward_traj in env_reward_trajs_split]
                 )
                 episode_best_reward = np.array(
                     [
@@ -246,6 +349,7 @@ class TrainSACDiffusionEBMAgent(TrainAgent):
                     ]
                 )
                 avg_episode_reward = float(np.mean(episode_reward))
+                avg_env_episode_reward = float(np.mean(env_episode_reward)) if num_episode_finished > 0 else 0.0
                 avg_best_reward = float(np.mean(episode_best_reward))
                 success_rate = float(
                     np.mean(
@@ -255,6 +359,7 @@ class TrainSACDiffusionEBMAgent(TrainAgent):
             else:
                 num_episode_finished = 0
                 avg_episode_reward = 0.0
+                avg_env_episode_reward = 0.0
                 avg_best_reward = 0.0
                 success_rate = 0.0
 
@@ -328,13 +433,14 @@ class TrainSACDiffusionEBMAgent(TrainAgent):
                 time = timer()
                 if eval_mode:
                     log.info(
-                        f"eval: success rate {success_rate:8.4f} | avg episode reward {avg_episode_reward:8.4f} | avg best reward {avg_best_reward:8.4f}"
+                        f"eval: success rate {success_rate:8.4f} | avg episode reward {avg_episode_reward:8.4f} | avg episode env reward {avg_env_episode_reward:8.4f} | avg best reward {avg_best_reward:8.4f}"
                     )
                     if self.use_wandb:
                         wandb.log(
                             {
                                 "success rate - eval": success_rate,
                                 "avg episode reward - eval": avg_episode_reward,
+                                "avg episode env reward - eval": avg_env_episode_reward,
                                 "avg best reward - eval": avg_best_reward,
                                 "num episode - eval": num_episode_finished,
                             },
@@ -342,58 +448,18 @@ class TrainSACDiffusionEBMAgent(TrainAgent):
                             commit=True,
                         )
                 else:
-                    # Diagnostics for Q/V/E and shaped reward
-                    diag = {}
-                    if self.itr >= self.n_explore_steps and len(obs_buffer) >= self.batch_size:
-                        inds = np.random.choice(len(obs_array), self.batch_size)
-                        obs_b = torch.from_numpy(obs_array[inds]).float().to(self.device)
-                        next_obs_b = torch.from_numpy(next_obs_array[inds]).float().to(self.device)
-                        obs_diag = {"state": obs_b}
-                        next_obs_diag = {"state": next_obs_b}
-                        with torch.no_grad():
-                            actions_d, chains_d = self.model._sample_action_and_chain(obs_diag, deterministic=False)
-                            q1_d = self.model.critic_q1(obs_diag, actions_d).view(-1)
-                            q2_d = self.model.critic_q2(obs_diag, actions_d).view(-1)
-                            v_d = self.model.critic_v(obs_diag).view(-1)
-                            target_v_d = self.model.target_v(next_obs_diag).view(-1)
-                            if getattr(self.model, "ebm_model", None) is not None:
-                                E_d = self.model._compute_energy(obs_diag, actions_d)
-                                diag["energy mean"] = float(E_d.mean().item())
-                                diag["energy std"] = float(E_d.std().item())
-                            if self.potential is not None:
-                                r_shape_d = self.potential.shape_reward(obs_b, next_obs_b, self.gamma)
-                                diag["pbrs mean"] = float(r_shape_d.mean().item())
-                                diag["pbrs std"] = float(r_shape_d.std().item())
-                        diag.update({
-                            "q1 mean": float(q1_d.mean().item()),
-                            "q2 mean": float(q2_d.mean().item()),
-                            "v mean": float(v_d.mean().item()),
-                            "v_target mean": float(target_v_d.mean().item()),
-                        })
-
                     alpha_val = float(self.log_alpha.exp().item())
-                    line = f"{self.itr}: step {cnt_train_step:8d} | reward {avg_episode_reward:8.4f} | alpha {alpha_val:8.4f} | t:{time:8.4f}"
-                    if self.itr >= self.n_explore_steps and last_loss_q is not None:
-                        line += f" | loss_q {last_loss_q:8.4f} | loss_v {last_loss_v:8.4f} | loss_pi {last_loss_pi:8.4f}"
-                        if last_loss_alpha is not None:
-                            line += f" | loss_alpha {last_loss_alpha:8.4f}"
+                    line = f"{self.itr}: step {cnt_train_step:8d} | reward {avg_episode_reward:8.4f} | env reward {avg_env_episode_reward:8.4f} | alpha {alpha_val:8.4f} | t:{time:8.4f}"
                     log.info(line)
                     if self.use_wandb:
                         payload = {
                             "total env step": cnt_train_step,
                             "avg episode reward - train": avg_episode_reward,
+                            "avg episode env reward - train": avg_env_episode_reward,
                             "entropy coeff": alpha_val,
-                            "buffer size": len(obs_buffer),
+                            # keep minimal, remove verbose diagnostics
+                            "method": "SAC+EBM",
                         }
-                        if self.itr >= self.n_explore_steps and last_loss_q is not None:
-                            payload.update({
-                                "loss - critic": last_loss_q,
-                                "loss - value": last_loss_v,
-                                "loss - actor": last_loss_pi,
-                            })
-                            if last_loss_alpha is not None:
-                                payload["loss - alpha"] = last_loss_alpha
-                        payload.update(diag)
                         wandb.log(payload, step=self.itr, commit=True)
 
             self.itr += 1

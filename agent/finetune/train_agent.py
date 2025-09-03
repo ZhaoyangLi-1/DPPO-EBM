@@ -34,6 +34,8 @@ class TrainAgent:
                 entity=cfg.wandb.entity,
                 project=cfg.wandb.project,
                 name=cfg.wandb.run,
+                group=getattr(cfg.wandb, "group", None),
+                tags=getattr(cfg.wandb, "tags", None),
                 config=OmegaConf.to_container(cfg, resolve=True),
             )
 

@@ -33,7 +33,8 @@ class SACDiffusionEBM(SACDiffusion):
         critic_v,
         ebm: Optional[nn.Module] = None,
         ebm_ckpt_path: Optional[str] = None,
-        use_ebm_reward_shaping: bool = False,  # handled in agent at rollout
+        use_energy_in_actor_loss: bool = False,  # new: default False per theory (use log pi)
+        gamma_denoising: float = 1.0,
         **kwargs,
     ):
         super().__init__(
@@ -44,13 +45,14 @@ class SACDiffusionEBM(SACDiffusion):
             **kwargs,
         )
 
-        # EBM for entropy surrogate in actor loss
+        # EBM for optional energy surrogate in actor loss
         self.ebm_model = None
         if ebm is not None:
             self.set_ebm(ebm, ebm_ckpt_path)
 
-        # Metadata toggle (PBRS applied externally by the training agent)
-        self.use_ebm_reward_shaping = use_ebm_reward_shaping
+        # No PBRS toggle here; shaping removed
+        self.use_energy_in_actor_loss = bool(use_energy_in_actor_loss)
+        self.gamma_denoising = float(gamma_denoising)
 
         # Normalization stats for actions; provided by agent via setup
         self._stats: Optional[Dict[str, Any]] = None
@@ -100,7 +102,8 @@ class SACDiffusionEBM(SACDiffusion):
             a_norm = actions
 
         k_vec = torch.zeros(B, dtype=torch.long, device=poses.device)  # k=0 final action
-        E_out = self.ebm_model(k_idx=k_vec, views=None, poses=poses, actions=a_norm)
+        t_vec = torch.zeros(B, dtype=torch.long, device=poses.device)  # default env step = 0
+        E_out = self.ebm_model(k_idx=k_vec, t_idx=t_vec, views=None, poses=poses, actions=a_norm)
         E = E_out[0] if isinstance(E_out, (tuple, list)) else E_out
         if E.dim() >= 2 and E.size(0) == B:  # average extra dims if any
             E = E.mean(dim=tuple(range(1, E.dim())))
@@ -108,14 +111,19 @@ class SACDiffusionEBM(SACDiffusion):
 
     def loss_actor(self, obs: dict, alpha: float) -> torch.Tensor:
         """
-        Replace log pi with -E(s,a) in the actor objective:
-            L_pi ≈ E[ -Q_min(s,a) - alpha * E(s,a) ]
+        Actor objective:
+          - If use_energy_in_actor_loss=True:  L ≈ E[ -Q_min(s,a) - alpha * E(s,a) ]
+          - Else (default):                   L = E[ -Q_min(s,a) + alpha * log pi(a|s) ]
         """
-        actions, _ = self._sample_action_and_chain(obs, deterministic=False)
+        actions, chains = self._sample_action_and_chain(obs, deterministic=False)
         q1, q2 = self.critic_q1(obs, actions), self.critic_q2(obs, actions)
         q_min = torch.minimum(q1.view(-1), q2.view(-1))
-        E = self._compute_energy(obs, actions)
-        loss_pi = (-q_min - float(alpha) * E).mean()
-        return loss_pi
+        if self.use_energy_in_actor_loss:
+            E = self._compute_energy(obs, actions)
+            return (-q_min - float(alpha) * E).mean()
+        else:
+            log_pi = self._chain_logprob(obs, chains)
+            # Optional KL(π||π_BC) penalty can be emulated by a small L2 between actor_ft and actor outputs.
+            return (-q_min + float(alpha) * log_pi).mean()
 
 

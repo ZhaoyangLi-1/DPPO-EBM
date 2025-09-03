@@ -28,8 +28,8 @@ class EBMWrapper(nn.Module):
         self.config = Config()
         self.model = OriginalEBM(self.config)
 
-    def forward(self, k_idx, views=None, poses=None, actions=None, **kwargs):
-        return self.model(k_idx=k_idx, views=views, poses=poses, actions=actions)
+    def forward(self, k_idx, t_idx,views=None, poses=None, actions=None, **kwargs):
+        return self.model(k_idx=k_idx, t_idx=t_idx, views=views, poses=poses, actions=actions)
 
     def __getattr__(self, name):
         if name in ["model", "config", "__dict__"]:

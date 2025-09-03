@@ -1,18 +1,20 @@
 defaults:
   - _self_
-hydra:
-  run:  
-    dir: ${logdir}
-_target_: agent.finetune.train_ppo_diffusion_ebm_agent.TrainPPODiffusionEBMAgent
 
-name: ${env_name}_ppo_diffusion_ebm_mlp_ta${horizon_steps}_td${denoising_steps}_tdf${ft_denoising_steps}
+hydra:
+  run:
+    dir: ${logdir}
+
+_target_: agent.finetune.train_ppo_diffusion_agent.TrainPPODiffusionAgent
+
+name: ${env_name}_ppo_diffusion_mlp_ta${horizon_steps}_td${denoising_steps}_tdf${ft_denoising_steps}_no_ebm
 logdir: ${oc.env:DPPO_LOG_DIR}/gym-finetune/${name}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
-base_policy_path: ${oc.env:DPPO_LOG_DIR}/gym-pretrain/walker2d-medium-v2_pre_diffusion_mlp_ta4_td20/2024-06-12_23-06-12/checkpoint/state_3000.pt
+base_policy_path: ${oc.env:DPPO_LOG_DIR}/gym-pretrain/halfcheetah-medium-v2_pre_diffusion_mlp_ta4_td20/2024-06-12_23-04-42/checkpoint/state_3000.pt
 normalization_path: ${oc.env:DPPO_DATA_DIR}/gym/${env_name}/normalization.npz
 
 seed: 42
 device: cuda:0
-env_name: walker2d-medium-v2
+env_name: halfcheetah-medium-v2
 obs_dim: 17
 action_dim: 6
 denoising_steps: 20
@@ -39,8 +41,10 @@ env:
 
 wandb:
   entity: ${oc.env:DPPO_WANDB_ENTITY}
-  project: gym-${env_name}-finetune-ebm
-  run: ${now:%H-%M-%S}_${name}
+  project: gym-${env_name}-finetune-ppo
+  run: ${name}_PPO_No_EBM
+  group: ${oc.env:WANDB_GROUP,${env_name}-ppo-baseline}
+  tags: [DPPO-Baseline]
 
 train:
   n_train_itr: 1000
@@ -74,7 +78,7 @@ train:
   target_kl: 1
 
 model:
-  _target_: model.diffusion.diffusion_ppo_ebm.PPODiffusionEBM
+  _target_: model.diffusion.diffusion_ppo.PPODiffusion
 
   # Standard PPO parameters
   gamma_denoising: 0.99
@@ -85,21 +89,6 @@ model:
   min_sampling_denoising_std: 0.1
   min_logprob_denoising_std: 0.1
 
-  # EBM features completely disabled
-  use_energy_scaling: False
-  use_ebm_reward_shaping: False
-  use_ebm_reward: False
-  
-  # EBM model configuration (disabled)
-  # ebm:
-  #   _target_: model.ebm.EBM
-  #   obs_dim: ${obs_dim}
-  #   action_dim: ${action_dim}
-  #   hidden_dim: 256
-  #   num_layers: 4
-
-  # EBM checkpoint path (disabled)
-  # ebm_ckpt_path: /linting-slow-vol/EBM-Guidance/outputs/gym/ebm_best_val_walker2d-v2-medium.pt
   # Network configuration
   network_path: ${base_policy_path}
   actor:

@@ -129,7 +129,8 @@ class TrainSACDiffusionAgent(TrainAgent):
                 else:
                     with torch.no_grad():
                         cond = {"state": torch.from_numpy(prev_obs_venv["state"]).float().to(self.device)}
-                        samples = self.model(cond=cond, deterministic=eval_mode, return_chain=False)
+                        # Request chain to satisfy diffusion forward path expectations.
+                        samples = self.model(cond=cond, deterministic=eval_mode, return_chain=True)
                         output_venv = samples.trajectories.cpu().numpy()
                         action_venv = output_venv[:, : self.act_steps]
 
@@ -264,14 +265,17 @@ class TrainSACDiffusionAgent(TrainAgent):
             if self.itr % self.log_freq == 0:
                 time = timer()
                 if eval_mode:
+                    # For pure SAC, env reward equals total reward (no replacement)
+                    avg_env_episode_reward = avg_episode_reward
                     log.info(
-                        f"eval: success rate {success_rate:8.4f} | avg episode reward {avg_episode_reward:8.4f} | avg best reward {avg_best_reward:8.4f}"
+                        f"eval: success rate {success_rate:8.4f} | avg episode reward {avg_episode_reward:8.4f} | avg episode env reward {avg_env_episode_reward:8.4f} | avg best reward {avg_best_reward:8.4f}"
                     )
                     if self.use_wandb:
                         wandb.log(
                             {
                                 "success rate - eval": success_rate,
                                 "avg episode reward - eval": avg_episode_reward,
+                                "avg episode env reward - eval": avg_env_episode_reward,
                                 "avg best reward - eval": avg_best_reward,
                                 "num episode - eval": num_episode_finished,
                             },
@@ -305,7 +309,9 @@ class TrainSACDiffusionAgent(TrainAgent):
                         }
 
                     alpha_val = float(self.log_alpha.exp().item())
-                    line = f"{self.itr}: step {cnt_train_step:8d} | reward {avg_episode_reward:8.4f} | alpha {alpha_val:8.4f} | t:{time:8.4f}"
+                    # For pure SAC, env reward equals total reward (no replacement)
+                    avg_env_episode_reward = avg_episode_reward
+                    line = f"{self.itr}: step {cnt_train_step:8d} | reward {avg_episode_reward:8.4f} | env reward {avg_env_episode_reward:8.4f} | alpha {alpha_val:8.4f} | t:{time:8.4f}"
                     if self.itr >= self.n_explore_steps and last_loss_q is not None:
                         line += f" | loss_q {last_loss_q:8.4f} | loss_v {last_loss_v:8.4f} | loss_pi {last_loss_pi:8.4f}"
                         if last_loss_alpha is not None:
@@ -315,8 +321,10 @@ class TrainSACDiffusionAgent(TrainAgent):
                         payload = {
                             "total env step": cnt_train_step,
                             "avg episode reward - train": avg_episode_reward,
+                            "avg episode env reward - train": avg_env_episode_reward,
                             "entropy coeff": alpha_val,
-                            "buffer size": len(obs_buffer),
+                            # keep keys aligned with SAC+EBM; drop verbose buffer size
+                            "method": "SAC",
                         }
                         if self.itr >= self.n_explore_steps and last_loss_q is not None:
                             payload.update(

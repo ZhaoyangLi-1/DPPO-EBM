@@ -116,7 +116,7 @@ model:
     activation_type: Mish
     residual_style: True
   ebm_model:
-    _target_: model.ebm.ebm.EBMWrapper
+    _target_: model.ebm.EBMWrapper
     # EBM model configuration
     hidden_dim: 256
     num_layers: 3

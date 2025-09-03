@@ -2,250 +2,174 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import timm
 
-# Make timm import optional
-try:
-    import timm
-    from timm.layers import DropPath
-    TIMM_AVAILABLE = True
-except ImportError:
-    TIMM_AVAILABLE = False
-    print("Warning: timm not available. Image processing features will be disabled.")
+def _rope_build_inv_freq(dim: int, base: float = 10000.0, device=None):
+    return 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
 
-# ------------------------------------------------------------------
-# 0.  Sinusoidal Positional Encoding
-# ------------------------------------------------------------------
+def _rope_angles_from_pos(pos: torch.Tensor, dim: int, base: float = 10000.0):
+    pos = pos.to(torch.float32).view(-1, 1)
+    inv_freq = _rope_build_inv_freq(dim, base=base, device=pos.device)
+    theta = torch.matmul(pos, inv_freq.view(1, -1))
+    cos = torch.cos(theta).unsqueeze(1)
+    sin = torch.sin(theta).unsqueeze(1)
+    return cos, sin
+
+def _rope_rotate_vec(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    B, D = x.shape
+    x1 = x.view(B, D // 2, 2)[..., 0]
+    x2 = x.view(B, D // 2, 2)[..., 1]
+    xr0 = x1 * cos.squeeze(1) - x2 * sin.squeeze(1)
+    xr1 = x1 * sin.squeeze(1) + x2 * cos.squeeze(1)
+    return torch.stack([xr0, xr1], dim=-1).reshape(B, D)
+
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:      # x:(B,) or (T,)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         device = x.device
-        half   = self.dim // 2
-        freq   = torch.exp(
-            -math.log(10000.0) * torch.arange(half, device=device, dtype=torch.float32) / (half - 1)
-        )                                                    # (half,)
-        emb = x.unsqueeze(-1) * freq                         # (B,half)
-        emb = torch.cat([emb.sin(), emb.cos()], dim=-1)      # (B,dim)
-        if self.dim % 2 == 1:                                # odd dim pad
+        half = self.dim // 2
+        freq = torch.exp(-math.log(10000.0) * torch.arange(half, device=device, dtype=torch.float32) / (half - 1))
+        emb = x.unsqueeze(-1) * freq
+        emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
+        if self.dim % 2 == 1:
             emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
-        return emb                                           # (B,dim)
+        return emb
 
-# ------------------------------------------------------------------
-# 1.  Attention Pool over multi-view features
-# ------------------------------------------------------------------
 class AttentionPool(nn.Module):
     def __init__(self, hid: int):
         super().__init__()
-        self.q    = nn.Linear(hid, hid)
-        self.k    = nn.Linear(hid, hid)
-        self.v    = nn.Linear(hid, hid)
-        self.norm = nn.LayerNorm(hid)
+        self.q = nn.Linear(hid, hid)
+        self.k = nn.Linear(hid, hid)
+        self.v = nn.Linear(hid, hid)
         self.proj = nn.Linear(hid, hid)
+        self.norm = nn.LayerNorm(hid)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        q = self.q(x[:, :1])
+        k = self.k(x)
+        v = self.v(x)
+        w = (q @ k.transpose(-2, -1)) / math.sqrt(x.size(-1))
+        pooled = (w.softmax(-1) @ v).squeeze(1)
+        return self.norm(self.proj(pooled))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:      # x:(B,V,H)
-        q = self.q(x[:, :1])                                 # (B,1,H)
-        k = self.k(x)                                        # (B,V,H)
-        v = self.v(x)                                        # (B,V,H)
-        attn = (q @ k.transpose(-2, -1)) / math.sqrt(x.size(-1))  # (B,1,V)
-        w    = attn.softmax(dim=-1)                          # (B,1,V)
-        pooled = (w @ v).squeeze(1)                          # (B,H)
-        return self.norm(self.proj(pooled))                  # (B,H)
-
-# ------------------------------------------------------------------
-# 2.  ConvNeXt backbone -> view embedding (only if timm is available)
-# ------------------------------------------------------------------
 class ConvNeXtMultiView(nn.Module):
     def __init__(self, num_views: int, hid: int = 512):
         super().__init__()
-        if not TIMM_AVAILABLE:
-            raise ImportError("timm is required for ConvNeXtMultiView. Please install timm or set num_views to None.")
-        
-        self.backbone = timm.create_model(
-            "convnext_tiny", pretrained=True, features_only=True
-        )
+        self.backbone = timm.create_model("convnext_tiny", pretrained=True, features_only=True)
         c_out = self.backbone.feature_info[-1]["num_chs"]
         self.proj = nn.Linear(c_out, hid, bias=False)
-        self.ln   = nn.LayerNorm(hid)
+        self.ln = nn.LayerNorm(hid)
         self.pool = AttentionPool(hid)
-        for p in self.backbone.parameters():        # freeze
+        for p in self.backbone.parameters():
             p.requires_grad = False
         self.num_views = num_views
-        self.hid       = hid
-
-    def forward(self, views: torch.Tensor) -> torch.Tensor:  # (B,V,C,H,W)
+        self.hid = hid
+    def forward(self, views: torch.Tensor) -> torch.Tensor:
         B, V, C, H, W = views.shape
         x = views.view(B * V, C, H, W)
-        feat = self.backbone(x)[-1].mean(dim=(-2, -1))       # (B*V,C_out)
-        feat = self.proj(feat).view(B, V, -1)                # (B,V,H)
-        return self.ln(self.pool(feat))                      # (B,H)
+        feat = self.backbone(x)[-1].mean(dim=(-2, -1))
+        feat = self.proj(feat).view(B, V, -1)
+        return self.ln(self.pool(feat))
 
-# ------------------------------------------------------------------
-# 3.  Residual MLP block
-# ------------------------------------------------------------------
-class ResidualMLPBlock(nn.Module):
-    def __init__(self, dim, expansion=4, drop=0.1):
-        super().__init__()
-        self.ln = nn.LayerNorm(dim)
-        self.fc1 = nn.Linear(dim, dim * expansion)
-        self.fc2 = nn.Linear(dim * expansion, dim)
-        self.drop = nn.Dropout(drop)
-        if TIMM_AVAILABLE:
-            self.drop_path = DropPath(drop)
-        else:
-            self.drop_path = nn.Dropout(drop)
-
-    def forward(self, x):
-        residual = x
-        x = self.ln(x)
-        x = F.gelu(self.fc1(x))
-        x = self.fc2(x)
-        x = self.drop_path(self.drop(x))
-        return residual + x
-
-# ------------------------------------------------------------------
-# 4.  State / Action encoders
-# ------------------------------------------------------------------
 class StateEncoder(nn.Module):
-    def __init__(self, state_dim: int, embed_dim: int, depth: int = 3, p_drop: float = 0.1):
+    def __init__(self, state_dim: int, embed_dim: int, depth: int = 4, p_drop: float = 0.1, hidden: int = None):
         super().__init__()
-        self.input_proj = nn.Linear(state_dim, embed_dim)
-        self.blocks = nn.Sequential(*[
-            ResidualMLPBlock(embed_dim, expansion=4, drop=p_drop)
-            for _ in range(depth)
-        ])
-
-    def forward(self, s: torch.Tensor) -> torch.Tensor:  # (B, D_s)
-        x = self.input_proj(s)
-        return self.blocks(x)  # (B, E)
-
-class MultiKernelDilatedConv1D(nn.Module):
-    def __init__(self, in_ch, out_ch, p_drop=0.1):
-        super().__init__()
-        self.convs = nn.ModuleList([
-            nn.Conv1d(in_ch, out_ch, 1, padding=0, dilation=1),
-            nn.Conv1d(in_ch, out_ch, 3, padding=1, dilation=1),
-            nn.Conv1d(in_ch, out_ch, 3, padding=2, dilation=2),
-            nn.Conv1d(in_ch, out_ch, 3, padding=4, dilation=4),
-        ])
-        self.ln = nn.LayerNorm(out_ch * len(self.convs))
-        self.drop = nn.Dropout(p_drop)
-
-    def forward(self, x):  # x: (B, C_in, T)
-        feats = [F.gelu(conv(x)) for conv in self.convs]     # each: (B, out_ch, T)
-        x = torch.cat(feats, dim=1)                          # (B, out_ch*4, T) = (B, 2E, T) 若 out_ch=E//2
-        x = x.transpose(1, 2)                                # (B, T, 2E)
-        return self.ln(self.drop(x))                         # (B, T, 2E)
+        hidden = hidden or (4 * embed_dim)
+        layers = [nn.LayerNorm(state_dim), nn.Linear(state_dim, hidden), nn.GELU(), nn.Dropout(p_drop)]
+        for _ in range(max(0, depth - 1)):
+            layers += [nn.Linear(hidden, hidden), nn.GELU(), nn.Dropout(p_drop)]
+        layers += [nn.Linear(hidden, embed_dim)]
+        self.net = nn.Sequential(*layers)
+    def forward(self, s: torch.Tensor) -> torch.Tensor:
+        return self.net(s)
 
 class ActionEncoder(nn.Module):
-    def __init__(self, action_dim: int, embed_dim: int, p_drop: float = 0.1, **_):
+    def __init__(self, action_dim: int, embed_dim: int, depth: int = 4, p_drop: float = 0.1, hidden: int = None):
         super().__init__()
-        self.input_proj = nn.Linear(action_dim, embed_dim)
-        self.multi_conv = MultiKernelDilatedConv1D(embed_dim, embed_dim // 2, p_drop)
-        self.proj_out = nn.Linear(embed_dim * 3, embed_dim)
+        hidden = hidden or (4 * embed_dim)
+        layers = [nn.LayerNorm(action_dim), nn.Linear(action_dim, hidden), nn.GELU(), nn.Dropout(p_drop)]
+        for _ in range(max(0, depth - 1)):
+            layers += [nn.Linear(hidden, hidden), nn.GELU(), nn.Dropout(p_drop)]
+        layers += [nn.Linear(hidden, embed_dim)]
+        self.net = nn.Sequential(*layers)
+    def forward(self, acts: torch.Tensor) -> torch.Tensor:
+        assert acts.dim() == 3
+        return self.net(acts)
 
-    def forward(self, acts: torch.Tensor) -> torch.Tensor:   # acts: (B, T, C_a)
-        assert acts.dim() == 3, f"expects (B,T,Ca), got {acts.shape}"
-        x0 = self.input_proj(acts)                           # (B, T, E)
-        x1 = self.multi_conv(x0.transpose(1, 2))            # (B, T, 2E)
-        out = torch.cat([x0, x1], dim=-1)                   # (B, T, 3E)
-        return self.proj_out(out)                           # (B, T, E)
-
-# ------------------------------------------------------------------
-# 5.  Main Energy-Based Model (no t_idx)
-# ------------------------------------------------------------------
 class EBM(nn.Module):
-    """Transformer-based Action-State-Image energy model (no t_idx)."""
     def __init__(self, cfg):
         super().__init__()
-        # ---------- cfg fields ----------
-        E              = cfg.ebm.embed_dim
-        self.embed_dim = E
+        E = cfg.ebm.embed_dim
+        self.E = E
         self.state_dim = cfg.ebm.state_dim
-        self.action_dim= cfg.ebm.action_dim
-        self.nhead     = cfg.ebm.nhead
-        self.depth     = cfg.ebm.depth
-        self.dropout   = cfg.ebm.dropout
-        self.use_cls   = cfg.ebm.use_cls_token
+        self.action_dim = cfg.ebm.action_dim
+        self.nhead = cfg.ebm.nhead
+        self.depth = cfg.ebm.depth
+        self.dropout = cfg.ebm.dropout
+        self.use_cls = cfg.ebm.use_cls_token
         self.num_views = cfg.ebm.num_views
-
-        # ---------- sub-modules ----------
-        self.state_proj  = StateEncoder(self.state_dim,  E, p_drop=0.1)
-        self.action_proj = ActionEncoder(self.action_dim, E, p_drop=0.1)
-
-        # Only create view encoder if num_views is specified and timm is available
-        if self.num_views and TIMM_AVAILABLE:
-            self.view_encoder = ConvNeXtMultiView(self.num_views, hid=E)
-        else:
-            self.view_encoder = None
-
-        # positional / denoise timestep embeddings
-        self.k_embed   = SinusoidalPosEmb(E)     # 去噪时间线
-        self.temp_pos  = SinusoidalPosEmb(E)     # 片段内相对位置 0..T-1
-
+        self.state_proj = StateEncoder(self.state_dim, E, p_drop=self.dropout, depth=self.depth)
+        self.action_proj = ActionEncoder(self.action_dim, E, p_drop=self.dropout, depth=self.depth)
+        self.view_encoder = (ConvNeXtMultiView(self.num_views, hid=E) if self.num_views else None)
+        self.temp_pos = SinusoidalPosEmb(E)
         if self.use_cls:
             self.cls_token = nn.Parameter(torch.randn(1, 1, E))
-
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=E, nhead=self.nhead, dim_feedforward=4*E,
-            dropout=self.dropout, activation="gelu", batch_first=True
-        )
+        enc_layer = nn.TransformerEncoderLayer(d_model=E, nhead=self.nhead, dim_feedforward=4 * E, dropout=self.dropout, activation="gelu", batch_first=True)
         self.transformer = nn.TransformerEncoder(enc_layer, num_layers=self.depth)
-
+        self.pool = AttentionPool(E)
         self.energy_head = nn.Sequential(
             nn.LayerNorm(E),
-            nn.Linear(E, 1)
+            nn.Linear(E, E),
+            nn.SiLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(E, 1),
         )
+        self.log_temp = nn.Parameter(torch.tensor(0.0))
+        self.beta = nn.Parameter(torch.tensor(1.0))
 
-    # ------------------------------------------------------------------
-    # forward (no t_idx)
-    # ------------------------------------------------------------------
-    def forward(
-        self,
-        k_idx: torch.Tensor,            # (B,)  去噪时间线索引
-        views:  torch.Tensor,           # (B,V,C,H,W) or None
-        poses:  torch.Tensor,           # (B,D_s)
-        actions:torch.Tensor,           # (B,T,D_a)
-    ):
-        """
-        Returns
-        -------
-        energy : (B,)             negative score
-        token  : (B,E)            pooled representation (before head)
-        """
+    def encode_tokens(self, k_idx: torch.Tensor, t_idx: torch.Tensor, views: torch.Tensor, poses: torch.Tensor, actions: torch.Tensor):
+        # Accept actions as [B, H, A] or [B, T, H, A]; if 4D, collapse T by mean
+        if actions.dim() == 4:
+            actions = actions.mean(dim=1)
         B, T, _ = actions.size()
-        device  = actions.device
-
-        # (1)  encode action sequence + temporal position (片段内位置)
-        x = self.action_proj(actions)                       # (B,T,E)
+        device = actions.device
+        x = self.action_proj(actions)
         t_range = torch.arange(T, device=device, dtype=torch.float32)
-        pos_emb = self.temp_pos(t_range).unsqueeze(0)       # (1,T,E)
-        x = x + pos_emb                                     # (B,T,E)
+        pos_emb = self.temp_pos(t_range).unsqueeze(0)
+        x = x + pos_emb
 
-        # (2) add denoising-time embeddings (仅 k_idx)
-        x = x + self.k_embed(k_idx).unsqueeze(1)            # (B,T,E)
-
-        # (3) encode state (pose) + image token
-        pose_tok = self.state_proj(poses).unsqueeze(1)      # (B,1,E)
+        pose_tok = self.state_proj(poses).unsqueeze(1)
         if self.view_encoder and views is not None:
-            img_tok = self.view_encoder(views).unsqueeze(1) # (B,1,E)
+            img_tok = self.view_encoder(views).unsqueeze(1)
         else:
             img_tok = torch.zeros_like(pose_tok)
-        s_token = pose_tok + img_tok                        # (B,1,E)
+        s_token = pose_tok + img_tok
 
-        # (4) concat sequence
         if self.use_cls:
-            cls = self.cls_token.expand(B, -1, -1)          # (B,1,E)
-            seq = torch.cat([cls, s_token, x], dim=1)       # (B,2+T,E)
-            out_idx = 0
+            cls = self.cls_token.expand(B, -1, -1)
+            seq = torch.cat([cls, s_token, x], dim=1)
         else:
-            seq = torch.cat([s_token, x], dim=1)            # (B,1+T,E)
-            out_idx = 0
+            seq = torch.cat([s_token, x], dim=1)
 
-        # (5) transformer + head
-        y   = self.transformer(seq)                         # (B,L,E)
-        y0  = y[:, out_idx, :]                              # (B,E)
-        en  = self.energy_head(y0).view(B)                  # (B,)
-        return en, y0
+        y = self.transformer(seq)
+        if self.use_cls:
+            y0 = y[:, 0, :]
+        else:
+            y0 = y[:, 0, :]
 
+        cos_t, sin_t = _rope_angles_from_pos(t_idx.to(y0.device), dim=self.E, base=10000.0)
+        y0 = _rope_rotate_vec(y0, cos_t, sin_t)
+
+        cos_k, sin_k = _rope_angles_from_pos(k_idx.to(y0.device), dim=self.E, base=10000.0)
+        y0 = _rope_rotate_vec(y0, cos_k, sin_k)
+
+        pooled = self.pool(y)
+
+        z = 0.5 * (y0 + pooled)
+        return z
+
+    def forward(self, k_idx: torch.Tensor, t_idx: torch.Tensor, views: torch.Tensor, poses: torch.Tensor, actions: torch.Tensor):
+        z = self.encode_tokens(k_idx, t_idx, views, poses, actions)
+        en = self.energy_head(z).view(-1)
+        return en, z

@@ -7,10 +7,10 @@ hydra:
 
 _target_: agent.finetune.train_sac_diffusion_ebm_agent.TrainSACDiffusionEBMAgent
 
-name: ${env_name}_sac_diffusion_ebm_mlp_ta${horizon_steps}_td${denoising_steps}_tdf${ft_denoising_steps}
-logdir: ${oc.env:DPPO_LOG_DIR}/gym-finetune/${name}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
-base_policy_path: ${oc.env:DPPO_LOG_DIR}/gym-pretrain/hopper-medium-v2_pre_diffusion_mlp_ta4_td20/2024-06-12_23-10-05/checkpoint/state_3000.pt
-normalization_path: ${oc.env:DPPO_DATA_DIR}/gym/${env_name}/normalization.npz
+name: ${env_name}_sac_diffusion_mlp_ta${horizon_steps}_td${denoising_steps}_tdf${ft_denoising_steps}
+logdir: ${oc.env:DPPO_LOG_DIR,${hydra:runtime.cwd}/log}/gym-finetune/${name}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
+base_policy_path: ${oc.env:DPPO_LOG_DIR,${hydra:runtime.cwd}/log}/gym-pretrain/hopper-medium-v2_pre_diffusion_mlp_ta4_td20/2024-06-12_23-10-05/checkpoint/state_3000.pt
+normalization_path: ${oc.env:DPPO_DATA_DIR,${hydra:runtime.cwd}/data}/gym/${env_name}/normalization.npz
 
 seed: 42
 device: cuda:0
@@ -40,37 +40,43 @@ env:
       max_episode_steps: ${env.max_episode_steps}
       reset_within_step: True
 
-wandb: null
-# wandb:
-#   entity: ${oc.env:DPPO_WANDB_ENTITY}
-#   project: gym-${env_name}-finetune-sac-ebm
-#   run: ${now:%H-%M-%S}_${name}
+# wandb: null
+wandb:
+  entity: ${oc.env:WANDB_ENTITY,${oc.env:DPPO_WANDB_ENTITY,null}}
+  project: ${oc.env:WANDB_PROJECT,gym-${env_name}-finetune-sac}
+  run: ${name}_SAC_EBM # ${now:%H-%M-%S}_${name}
+  group: ${oc.env:WANDB_GROUP,${env_name}-sac-vs-ebm}
+  tags: [SAC+EBM]
 
 train:
   n_train_itr: 1000
-  n_steps: 10
+  n_steps: 500
   gamma: 0.99
   
   # SAC parameters
   tau: 0.005
-  alpha: 0.2
+  alpha: 0.2  
   automatic_entropy_tuning: True
-  target_entropy: -3  # -action_dim
+  target_entropy: -2  # -action_dim
   
   # Learning rates
   actor_lr: 1e-4
   actor_weight_decay: 0
-  critic_lr: 1e-3
+  critic_lr: 5e-4
   critic_weight_decay: 0
+  actor_lr_scheduler:
+    first_cycle_steps: 200
+    warmup_steps: 50
+    min_lr: 1e-5
   
   # Buffer and batch parameters
   buffer_size: 100000
-  batch_size: 256
-  replay_ratio: 1
+  batch_size: 1024
+  replay_ratio: 4
   
   # Evaluation parameters
   n_eval_episode: 10
-  n_explore_steps: 1000
+  n_explore_steps: 1
   
   # Logging and saving
   save_model_freq: 100
@@ -79,6 +85,7 @@ train:
     freq: 1
     num: 0
   log_freq: 1
+  
 
 model:
   _target_: model.diffusion.diffusion_sac_ebm.SACDiffusionEBM
@@ -90,20 +97,23 @@ model:
   automatic_entropy_tuning: True
   target_entropy: -3
 
-  # Energy scaling parameters
+  # Denoising step discount for dense EBM reward weighting
+  gamma_denoising: 0.95
+
+  # Energy scaling parameters (for EBM calibration utilities)
   use_energy_scaling: True
   energy_scaling_momentum: 0.99
   energy_scaling_eps: 1e-6
   energy_scaling_use_mad: True
 
-  # Potential-based reward shaping parameters
-  use_ebm_reward_shaping: True
-  pbrs_lambda: 1.0
-  pbrs_beta: 1.0
-  pbrs_alpha: 1.0
-  pbrs_M: 4
-  pbrs_use_mu_only: True
-  pbrs_k_use_mode: "all"
+  # EBM scalar reward (replaces env reward)
+  use_ebm_reward: True
+  ebm_reward_mode: dense  # {k0, dense}
+  ebm_reward_clip_u_max: 10.0
+  ebm_reward_lambda: 1.5
+  ebm_reward_baseline_M: 16
+  ebm_reward_baseline_use_mu_only: False
+
 
 
   # EBM model configuration
@@ -113,6 +123,10 @@ model:
     action_dim: ${action_dim}
     hidden_dim: 256
     num_layers: 4
+    nhead: 8
+    dropout: 0.0
+    num_views: null
+    use_cls_token: False
 
   # EBM checkpoint path (optional)
   ebm_ckpt_path: /linting-slow-vol/EBM-Guidance/outputs/gym/ebm_best_val_hopper-v2-medium.pt
@@ -134,8 +148,9 @@ model:
   # Critic networks (Q-functions)
   critic_q1:
     _target_: model.common.critic.CriticObsAct
-    cond_dim: ${obs_dim}
+    cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
     action_dim: ${action_dim}
+    action_steps: ${act_steps}
     mlp_dims: [256, 256, 256]
     activation_type: Mish
     residual_style: True
@@ -143,8 +158,9 @@ model:
   
   critic_q2:
     _target_: model.common.critic.CriticObsAct
-    cond_dim: ${obs_dim}
+    cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
     action_dim: ${action_dim}
+    action_steps: ${act_steps}
     mlp_dims: [256, 256, 256]
     activation_type: Mish
     residual_style: True

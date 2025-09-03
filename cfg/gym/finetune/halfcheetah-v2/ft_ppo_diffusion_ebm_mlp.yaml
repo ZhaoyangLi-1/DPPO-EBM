@@ -85,31 +85,21 @@ model:
   min_sampling_denoising_std: 0.1
   min_logprob_denoising_std: 0.1
 
-  # Energy scaling parameters (optional; not required by theory-based PBRS)
-  use_energy_scaling: True
-  energy_scaling_momentum: 0.99
-  energy_scaling_eps: 1e-6
-  energy_scaling_use_mad: True
+  # EBM features completely disabled
+  use_energy_scaling: False
+  use_ebm_reward_shaping: False
+  use_ebm_reward: False
+  
+  # EBM model configuration (disabled)
+  # ebm:
+  #   _target_: model.ebm.EBM
+  #   obs_dim: ${obs_dim}
+  #   action_dim: ${action_dim}
+  #   hidden_dim: 256
+  #   num_layers: 4
 
-  # Potential-based reward shaping parameters
-  use_ebm_reward_shaping: True
-  pbrs_lambda: 1.0
-  pbrs_beta: 1.0
-  pbrs_alpha: 1.0
-  pbrs_M: 4
-  pbrs_use_mu_only: True
-  pbrs_k_use_mode: "all"
-
-  # EBM model configuration
-  ebm:
-    _target_: model.ebm.EBM
-    obs_dim: ${obs_dim}
-    action_dim: ${action_dim}
-    hidden_dim: 256
-    num_layers: 4
-
-  # EBM checkpoint path (optional)
-  ebm_ckpt_path: /linting-slow-vol/EBM-Guidance/outputs/gym/ebm_best_val_halfCheetah-v2-medium.pt
+  # EBM checkpoint path (disabled)
+  # ebm_ckpt_path: /linting-slow-vol/EBM-Guidance/outputs/gym/ebm_best_val_halfCheetah-v2-medium.pt
 
   # Network configuration
   network_path: ${base_policy_path}

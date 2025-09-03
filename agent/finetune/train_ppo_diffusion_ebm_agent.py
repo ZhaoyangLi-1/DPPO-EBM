@@ -22,7 +22,7 @@ log = logging.getLogger(__name__)
 from util.timer import Timer
 from agent.finetune.train_ppo_diffusion_agent import TrainPPODiffusionAgent
 from model.diffusion.diffusion_ppo_ebm import PPODiffusionEBM
-from model.diffusion.energy_utils import KFreePotential, build_k_use_indices
+from model.diffusion.energy_utils import build_k_use_indices, KFreePotential
 
 
 def unravel_index(indices: torch.Tensor, shape: tuple):
@@ -107,21 +107,17 @@ class KFreePotentialLegacy:
         # Normalize actions to [-1, 1] range
         a_norm = torch.clamp((A_k - act_min_t) / (act_max_t - act_min_t + 1e-6) * 2 - 1, -1.0, 1.0)
 
-        # Compute energy using EBM
-        E_out = self.ebm(k_idx=k_vec, views=None, poses=poses, actions=a_norm)
+        # Compute energy using EBM (pass t_idx for temporal embedding consistency)
+        E_out = self.ebm(k_idx=k_vec, t_idx=t_idx.to(self.device), views=None, poses=poses, actions=a_norm)
         E = E_out[0] if isinstance(E_out, (tuple, list)) else E_out
 
         # Average over additional dimensions if present
         if E.dim() >= 2 and E.size(0) == B:
             E = E.mean(dim=tuple(range(1, E.dim())))
-
-        # Update scaler and normalize energy
-        self.scaler.update(k_vec, E)
-        En = self.scaler.normalize(k_vec, E)
         
         # Return -β * E for log-sum-exp aggregation
         # This corresponds to the exp(-β * E_θ(s, a_k, k)) term in the mathematical formula
-        return -self.beta * En
+        return -self.beta * E
 
     @torch.no_grad()
     def phi(self, obs_state: torch.Tensor, t_idx: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -278,6 +274,19 @@ class TrainPPODiffusionEBMAgent(TrainPPODiffusionAgent):
         self.use_energy_scaling = cfg.model.get("use_energy_scaling", False)
         self.use_ebm_reward_shaping = cfg.model.get("use_ebm_reward_shaping", False)
 
+        # New: EBM scalar reward replacement per the Diffusion-MDP theory
+        # If enabled, replace environment rewards with calibrated EBM utilities.
+        self.use_ebm_reward = cfg.model.get("use_ebm_reward", False)
+        self.ebm_reward_mode = cfg.model.get("ebm_reward_mode", "k0")  # "k0" or "dense"
+        self.ebm_reward_clip_u_max = cfg.model.get("ebm_reward_clip_u_max", 5.0)
+        self.ebm_reward_use_mad = cfg.model.get("ebm_reward_use_mad", True)
+        # Global scale for utilities; optionally a per-k vector can be provided via cfg.model.ebm_reward_lambda_per_k
+        self.ebm_reward_lambda = cfg.model.get("ebm_reward_lambda", 1.0)
+        self.ebm_reward_lambda_per_k = cfg.model.get("ebm_reward_lambda_per_k", None)
+        # Baseline sampling hyperparams
+        self.ebm_reward_baseline_M = cfg.model.get("ebm_reward_baseline_M", 4)
+        self.ebm_reward_baseline_use_mu_only = cfg.model.get("ebm_reward_baseline_use_mu_only", False)
+
         self.ebm_model = None            # runtime EBM (nn.Module)
         self.potential_function = None   # runtime potential φ(s)
         self.stats = None                # normalization stats used across methods
@@ -341,6 +350,29 @@ class TrainPPODiffusionEBMAgent(TrainPPODiffusionAgent):
         # ---------------------------------------------------------------------
         if _orig_use_ebm_reward_shaping:
             self._setup_potential_function(cfg)
+
+        # ---------------------------------------------------------------------
+        # 5) Setup EBM scalar reward calibration utilities (baseline + scaler)
+        # ---------------------------------------------------------------------
+        self.energy_scaler_reward = None
+        self.pi0_for_reward = None
+        if self.use_ebm_reward:
+            if self.ebm_model is None:
+                # Ensure EBM is available when ebm reward is requested
+                self._setup_ebm_model(cfg)
+            # Build running scaler per denoising step (MAD or STD)
+            from model.diffusion.energy_utils import EnergyScalerPerK
+            self.energy_scaler_reward = EnergyScalerPerK(
+                K=self.model.ft_denoising_steps,
+                momentum=cfg.model.get("energy_scaling_momentum", 0.99),
+                eps=cfg.model.get("energy_scaling_eps", 1e-6),
+                use_mad=self.ebm_reward_use_mad,
+            )
+            # Frozen BC/base policy copy for baseline β_BC(s,k)
+            self.pi0_for_reward = copy.deepcopy(self.model).eval()
+            for p in self.pi0_for_reward.parameters():
+                p.requires_grad = False
+            log.info("Initialized EBM reward: scaler + frozen base policy baseline")
 
     def _setup_ebm_model(self, cfg):
         """Set up the energy-based model for PBRS."""
@@ -423,6 +455,134 @@ class TrainPPODiffusionEBMAgent(TrainPPODiffusionAgent):
 
         log.info(f"Setup potential function with k_use={k_use}")
 
+    def _compute_energy_values_generic(self, obs: torch.Tensor, chains: torch.Tensor, t_idx_vec: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
+        """
+        Compute EBM energies per denoising step for given obs and action chains.
+
+        Args:
+            obs:    [B, obs_dim]
+            chains: [B, K+1, H, A]
+
+        Returns:
+            energies: [B, K+1] or None if EBM/stats unavailable
+        """
+        if self.ebm_model is None or self.stats is None:
+            return None
+
+        assert chains.dim() == 4, f"chains must be [B, K+1, H, A], got {chains.shape}"
+        B, K_plus_1, H, A = chains.shape
+
+        # Prepare normalization tensors once
+        act_min = torch.tensor(self.stats["act_min"], dtype=torch.float32, device=self.device)
+        act_max = torch.tensor(self.stats["act_max"], dtype=torch.float32, device=self.device)
+        if act_min.ndim == 2:
+            act_min = act_min.min(dim=0).values
+        if act_max.ndim == 2:
+            act_max = act_max.max(dim=0).values
+        act_min = act_min.view(1, 1, -1)  # [1,1,A]
+        act_max = act_max.view(1, 1, -1)  # [1,1,A]
+
+        energy_values = torch.zeros(B, K_plus_1, device=self.device)
+        with torch.no_grad():
+            for k in range(0, K_plus_1):
+                # Map k=0 to the final (fully denoised) action
+                idx = K_plus_1 - 1 - k
+                actions_k = chains[:, idx, :, :]  # [B, H, A]
+                actions_norm = torch.clamp((actions_k - act_min) / (act_max - act_min + 1e-6) * 2 - 1, -1.0, 1.0)
+                k_vec = torch.full((B,), k, dtype=torch.long, device=self.device)
+                poses = obs[:, -1, :] if obs.dim() == 3 else obs
+                if t_idx_vec is None:
+                    t_vec = torch.zeros(B, dtype=torch.long, device=self.device)
+                else:
+                    t_vec = t_idx_vec.to(self.device).long().view(-1)
+                E_out = self.ebm_model(k_idx=k_vec, t_idx=t_vec, views=None, poses=poses, actions=actions_norm)
+                E = E_out[0] if isinstance(E_out, (tuple, list)) else E_out
+                if E.dim() >= 2 and E.size(0) == B:
+                    E = E.mean(dim=tuple(range(1, E.dim())))
+                energy_values[:, k] = E
+        return energy_values
+
+    def _compute_ebm_reward_from_chains(self, obs_state_np, chains_np, t_idx_np: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        Compute calibrated EBM reward R_t from energies, replacing env reward.
+
+        Implements: u(t,k) = -(E(s,a_k,k) - beta_BC(s,k)) / tau_k,
+        with tau_k from running MAD/STD over baseline energies per k.
+
+        Modes:
+          - k0: use only k=0 utility
+          - dense: sum_k lambda_k * gamma_denoise^k * u(t,k)
+        """
+        if self.ebm_model is None or self.energy_scaler_reward is None or self.pi0_for_reward is None:
+            return np.zeros((chains_np.shape[0],), dtype=np.float32)
+
+        # Tensors
+        obs_b = torch.from_numpy(obs_state_np).float().to(self.device)
+        chains_curr = torch.from_numpy(chains_np).float().to(self.device)
+        t_idx_vec = None
+        if t_idx_np is not None:
+            t_idx_vec = torch.from_numpy(t_idx_np).to(self.device).long()
+
+        # Current energies per k
+        E_curr = self._compute_energy_values_generic(obs_b, chains_curr, t_idx_vec)  # [B, K+1]
+        if E_curr is None:
+            return np.zeros((chains_np.shape[0],), dtype=np.float32)
+
+        # Baseline chains from frozen base policy with robust aggregation over M samples
+        with torch.no_grad():
+            cond = {"state": obs_b}
+            E_base_list = []
+            M = max(1, int(self.ebm_reward_baseline_M))
+            for m in range(M):
+                det = bool(self.ebm_reward_baseline_use_mu_only)
+                samples_bc = self.pi0_for_reward(cond=cond, deterministic=det, return_chain=True)
+                chains_bc = samples_bc.chains  # [B, K+1, H, A]
+                E_b = self._compute_energy_values_generic(obs_b, chains_bc, t_idx_vec)
+                if E_b is None:
+                    continue
+                E_base_list.append(E_b.unsqueeze(0))
+        if len(E_base_list) == 0:
+            return np.zeros((chains_np.shape[0],), dtype=np.float32)
+        E_base_stack = torch.cat(E_base_list, dim=0)  # [M,B,K+1]
+        # median over samples for robustness
+        E_base = E_base_stack.median(dim=0).values  # [B,K+1]
+        if E_base is None:
+            return np.zeros((chains_np.shape[0],), dtype=np.float32)
+
+        B, K_plus_1 = E_curr.shape
+        # Update scaler with baseline energies (per-k running scale)
+        with torch.no_grad():
+            for k in range(0, K_plus_1):
+                k_vec = torch.full((B,), k, dtype=torch.long)
+                self.energy_scaler_reward.update(k_vec, E_base[:, k].detach().cpu())
+
+        # Compute utilities
+        u = torch.zeros(B, K_plus_1, device=self.device)
+        s_vec = self.energy_scaler_reward.s.to(self.device)  # length K+1
+        eps = 1e-6
+        for k in range(0, K_plus_1):
+            tau_k = torch.clamp(s_vec[k], min=1e-3)
+            u[:, k] = -(E_curr[:, k] - E_base[:, k]) / (tau_k + eps)
+            u[:, k] = torch.clamp(u[:, k], -float(self.ebm_reward_clip_u_max), float(self.ebm_reward_clip_u_max))
+
+        if self.ebm_reward_mode == "dense":
+            # Build lambda_k
+            if isinstance(self.ebm_reward_lambda_per_k, (list, tuple)):
+                lam = torch.tensor(list(self.ebm_reward_lambda_per_k)[:K_plus_1], dtype=torch.float32, device=self.device)
+                if lam.numel() < K_plus_1:
+                    lam = torch.nn.functional.pad(lam, (0, K_plus_1 - lam.numel()), value=float(self.ebm_reward_lambda))
+            else:
+                lam = torch.full((K_plus_1,), float(self.ebm_reward_lambda), device=self.device)
+            # gamma_denoise^k weights
+            gamma_dn = float(self.model.gamma_denoising)
+            w = torch.tensor([gamma_dn ** k for k in range(K_plus_1)], dtype=torch.float32, device=self.device)
+            rew = (u * lam.view(1, -1) * w.view(1, -1)).sum(dim=1)
+        else:
+            # k0 only
+            rew = u[:, 0]
+
+        return rew.detach().cpu().numpy().astype(np.float32)
+
     def _load_normalization_stats(self, normalization_path):
         """Load normalization statistics from file."""
         if normalization_path.endswith(".npz"):
@@ -478,9 +638,10 @@ class TrainPPODiffusionEBMAgent(TrainPPODiffusionAgent):
                 # Normalize actions to [-1, 1]
                 actions_norm = torch.clamp((actions_k - act_min) / (act_max - act_min + 1e-6) * 2 - 1, -1.0, 1.0)
 
-                # EBM energy
+                # EBM energy (pass t_idx explicitly for consistency)
                 k_vec = torch.full((B,), k, dtype=torch.long, device=self.device)
-                E_out = self.ebm_model(k_idx=k_vec, views=None, poses=obs, actions=actions_norm)
+                t_vec = torch.zeros(B, dtype=torch.long, device=self.device)
+                E_out = self.ebm_model(k_idx=k_vec, t_idx=t_vec, views=None, poses=obs, actions=actions_norm)
                 E = E_out[0] if isinstance(E_out, (tuple, list)) else E_out
 
                 # If E has extra dims (e.g., per-horizon), average them
@@ -561,6 +722,8 @@ class TrainPPODiffusionEBMAgent(TrainPPODiffusionAgent):
             )
             terminated_trajs = np.zeros((self.n_steps, self.n_envs))
             reward_trajs = np.zeros((self.n_steps, self.n_envs))
+            # Track raw env reward separately for fair eval logging when EBM reward replaces env reward
+            env_reward_trajs = np.zeros((self.n_steps, self.n_envs))
             pbrs_reward_trajs = np.zeros((self.n_steps, self.n_envs))
             if self.save_full_observations:  # state-only
                 obs_full_trajs = np.empty((0, self.n_envs, self.obs_dim))
@@ -602,7 +765,19 @@ class TrainPPODiffusionEBMAgent(TrainPPODiffusionAgent):
                 ) = self.venv.step(action_venv)
                 done_venv = terminated_venv | truncated_venv
 
-                # PBRS: r += lambda * (gamma * phi(s') - phi(s))
+                # Cache raw env reward before any replacement (for fair logging)
+                env_reward_trajs[step] = reward_venv
+
+                # Replace env reward with calibrated EBM utility if enabled
+                if self.use_ebm_reward and self.ebm_model is not None:
+                    # t_idx: use global env step index approximation: itr*n_steps + step
+                    t_idx_np = np.full((self.n_envs,), int(self.itr * self.n_steps + step), dtype=np.int64)
+                    ebm_rew = self._compute_ebm_reward_from_chains(
+                        prev_obs_venv["state"], chains_venv, t_idx_np
+                    )
+                    reward_venv = ebm_rew
+
+                # PBRS: r += lambda * (gamma * phi(s') - phi(s)) (optional)
                 if self.use_ebm_reward_shaping and self.potential_function is not None:
                     with torch.no_grad():
                         # Ensure tensors are properly formatted
@@ -653,9 +828,16 @@ class TrainPPODiffusionEBMAgent(TrainPPODiffusionAgent):
                     reward_trajs[start : end + 1, env_ind]
                     for env_ind, start, end in episodes_start_end
                 ]
+                env_reward_trajs_split = [
+                    env_reward_trajs[start : end + 1, env_ind]
+                    for env_ind, start, end in episodes_start_end
+                ]
                 num_episode_finished = len(reward_trajs_split)
                 episode_reward = np.array(
                     [np.sum(reward_traj) for reward_traj in reward_trajs_split]
+                )
+                env_episode_reward = np.array(
+                    [np.sum(reward_traj) for reward_traj in env_reward_trajs_split]
                 )
                 if (
                     self.furniture_sparse_reward
@@ -669,6 +851,7 @@ class TrainPPODiffusionEBMAgent(TrainPPODiffusionAgent):
                         ]
                     )
                 avg_episode_reward = np.mean(episode_reward)
+                avg_env_episode_reward = float(np.mean(env_episode_reward)) if num_episode_finished > 0 else 0.0
                 avg_best_reward = np.mean(episode_best_reward)
                 success_rate = np.mean(
                     episode_best_reward >= self.best_reward_threshold_for_success
@@ -677,6 +860,7 @@ class TrainPPODiffusionEBMAgent(TrainPPODiffusionAgent):
                 episode_reward = np.array([])
                 num_episode_finished = 0
                 avg_episode_reward = 0
+                avg_env_episode_reward = 0
                 avg_best_reward = 0
                 success_rate = 0
                 log.info("[WARNING] No episode completed within the iteration!")
@@ -815,6 +999,7 @@ class TrainPPODiffusionEBMAgent(TrainPPODiffusionAgent):
                         logprobs_b = logprobs_k[batch_inds_b, denoising_inds_b]
 
                         # get loss
+                        # Note: denoising-step advantage weighting is handled inside the model loss
                         (
                             pg_loss,
                             entropy_loss,
@@ -922,13 +1107,14 @@ class TrainPPODiffusionEBMAgent(TrainPPODiffusionAgent):
                 run_results[-1]["time"] = time
                 if eval_mode:
                     log.info(
-                        f"eval: success rate {success_rate:8.4f} | avg episode reward {avg_episode_reward:8.4f} | avg best reward {avg_best_reward:8.4f}"
+                        f"eval: success rate {success_rate:8.4f} | avg episode reward {avg_episode_reward:8.4f} | avg env episode reward {avg_env_episode_reward:8.4f} | avg best reward {avg_best_reward:8.4f}"
                     )
                     if self.use_wandb:
                         wandb.log(
                             {
                                 "success rate - eval": success_rate,
                                 "avg episode reward - eval": avg_episode_reward,
+                                "avg episode env reward - eval": avg_env_episode_reward,
                                 "avg best reward - eval": avg_best_reward,
                                 "num episode - eval": num_episode_finished,
                             },
@@ -940,7 +1126,7 @@ class TrainPPODiffusionEBMAgent(TrainPPODiffusionAgent):
                     run_results[-1]["eval_best_reward"] = avg_best_reward
                 else:
                     log.info(
-                        f"{self.itr}: step {cnt_train_step:8d} | loss {loss:8.4f} | pg loss {pg_loss:8.4f} | value loss {v_loss:8.4f} | bc loss {bc_loss:8.4f} | reward {avg_episode_reward:8.4f} | eta {eta:8.4f} | t:{time:8.4f}"
+                        f"{self.itr}: step {cnt_train_step:8d} | loss {loss:8.4f} | pg loss {pg_loss:8.4f} | value loss {v_loss:8.4f} | bc loss {bc_loss:8.4f} | reward {avg_episode_reward:8.4f} | env reward {avg_env_episode_reward:8.4f} | eta {eta:8.4f} | t:{time:8.4f}"
                     )
                     if self.use_wandb:
                         wandb.log(
@@ -956,6 +1142,7 @@ class TrainPPODiffusionEBMAgent(TrainPPODiffusionAgent):
                                 "clipfrac": np.mean(clipfracs),
                                 "explained variance": explained_var,
                                 "avg episode reward - train": avg_episode_reward,
+                                "avg episode env reward - train": avg_env_episode_reward,
                                 "num episode - train": num_episode_finished,
                                 "diffusion - min sampling std": diffusion_min_sampling_std,
                                 "actor lr": self.actor_optimizer.param_groups[0]["lr"],

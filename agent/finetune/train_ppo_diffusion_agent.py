@@ -197,6 +197,8 @@ class TrainPPODiffusionAgent(TrainPPOAgent):
                         ]
                     )
                 avg_episode_reward = np.mean(episode_reward)
+                # For pure DPPO, env reward equals total reward (no replacement)
+                avg_env_episode_reward = float(avg_episode_reward)
                 avg_best_reward = np.mean(episode_best_reward)
                 success_rate = np.mean(
                     episode_best_reward >= self.best_reward_threshold_for_success
@@ -205,6 +207,7 @@ class TrainPPODiffusionAgent(TrainPPOAgent):
                 episode_reward = np.array([])
                 num_episode_finished = 0
                 avg_episode_reward = 0
+                avg_env_episode_reward = 0
                 avg_best_reward = 0
                 success_rate = 0
                 log.info("[WARNING] No episode completed within the iteration!")
@@ -450,15 +453,17 @@ class TrainPPODiffusionAgent(TrainPPOAgent):
                 run_results[-1]["time"] = time
                 if eval_mode:
                     log.info(
-                        f"eval: success rate {success_rate:8.4f} | avg episode reward {avg_episode_reward:8.4f} | avg best reward {avg_best_reward:8.4f}"
+                        f"eval: success rate {success_rate:8.4f} | avg episode reward {avg_episode_reward:8.4f} | avg env episode reward {avg_env_episode_reward:8.4f} | avg best reward {avg_best_reward:8.4f}"
                     )
                     if self.use_wandb:
                         wandb.log(
                             {
                                 "success rate - eval": success_rate,
                                 "avg episode reward - eval": avg_episode_reward,
+                                "avg episode env reward - eval": avg_env_episode_reward,
                                 "avg best reward - eval": avg_best_reward,
                                 "num episode - eval": num_episode_finished,
+                                "method": "DPPO",
                             },
                             step=self.itr,
                             commit=True,
@@ -468,7 +473,7 @@ class TrainPPODiffusionAgent(TrainPPOAgent):
                     run_results[-1]["eval_best_reward"] = avg_best_reward
                 else:
                     log.info(
-                        f"{self.itr}: step {cnt_train_step:8d} | loss {loss:8.4f} | pg loss {pg_loss:8.4f} | value loss {v_loss:8.4f} | bc loss {bc_loss:8.4f} | reward {avg_episode_reward:8.4f} | eta {eta:8.4f} | t:{time:8.4f}"
+                        f"{self.itr}: step {cnt_train_step:8d} | loss {loss:8.4f} | pg loss {pg_loss:8.4f} | value loss {v_loss:8.4f} | bc loss {bc_loss:8.4f} | reward {avg_episode_reward:8.4f} | env reward {avg_env_episode_reward:8.4f} | eta {eta:8.4f} | t:{time:8.4f}"
                     )
                     if self.use_wandb:
                         wandb.log(
@@ -484,10 +489,12 @@ class TrainPPODiffusionAgent(TrainPPOAgent):
                                 "clipfrac": np.mean(clipfracs),
                                 "explained variance": explained_var,
                                 "avg episode reward - train": avg_episode_reward,
+                                "avg episode env reward - train": avg_env_episode_reward,
                                 "num episode - train": num_episode_finished,
                                 "diffusion - min sampling std": diffusion_min_sampling_std,
                                 "actor lr": self.actor_optimizer.param_groups[0]["lr"],
                                 "critic lr": self.critic_optimizer.param_groups[0]["lr"],
+                                "method": "DPPO",
                             },
                             step=self.itr,
                             commit=True,
