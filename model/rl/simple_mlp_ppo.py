@@ -64,7 +64,9 @@ class SimpleMLP_PPO(PPO_Gaussian):
         # Remove EBM-specific params from kwargs to avoid passing to parent
         clean_kwargs = {k: v for k, v in kwargs.items() 
                        if k not in ['use_ebm_reward', 'ebm_model', 'ebm_reward_scale', 
-                                   'ebm_reward_clip_max', 'obs_dim', 'action_dim', 'ebm', 'ebm_ckpt_path']}
+                                   'ebm_reward_clip_max', 'obs_dim', 'action_dim', 'ebm', 'ebm_ckpt_path',
+                                   'use_auto_scaling', 'use_dynamic_normalization', 'normalization_momentum',
+                                   'temperature_scale', 'normalization_epsilon']}
         
         super().__init__(
             actor=actor,
@@ -83,7 +85,9 @@ class SimpleMLP_PPO(PPO_Gaussian):
         self.ebm_reward_scale = ebm_reward_scale
         
         if self.use_ebm_reward and self.ebm_model is None:
-            log.warning("use_ebm_reward is True but no EBM model provided")
+            log.warning("use_ebm_reward is True but no EBM model provided - will be set later by agent")
+        elif self.use_ebm_reward and self.ebm_model is not None:
+            log.info(f"EBM reward enabled with scale={self.ebm_reward_scale}, model provided during init")
         
         if self.use_ebm_reward and self.ebm_model is not None:
             # Freeze EBM parameters

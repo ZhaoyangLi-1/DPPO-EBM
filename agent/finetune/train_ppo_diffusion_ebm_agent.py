@@ -108,11 +108,33 @@ class KFreePotentialLegacy:
         a_norm = torch.clamp((A_k - act_min_t) / (act_max_t - act_min_t + 1e-6) * 2 - 1, -1.0, 1.0)
 
         # Compute energy using EBM (pass t_idx for temporal embedding consistency)
-        E_out = self.ebm(k_idx=k_vec, t_idx=t_idx.to(self.device), views=None, poses=poses, actions=a_norm)
-        E = E_out[0] if isinstance(E_out, (tuple, list)) else E_out
+        # Check if EBM has forward_batch method for batch processing
+        if hasattr(self.ebm, 'forward_batch'):
+            # For forward_batch, we need [B, 4, T, A] format
+            # A_k is [B, H, A] where H is the horizon
+            H = a_norm.size(1)
+            if H < 4:
+                # Pad with repeated actions to get 4 actions
+                a_norm_padded = a_norm.repeat(1, 4, 1)[:, :4, :]  # [B, 4, A]
+            else:
+                a_norm_padded = a_norm[:, :4, :]  # Take first 4 if more than 4
+            
+            # Add temporal dimension for EBM: [B, 4, T=1, A]
+            a_norm_batch = a_norm_padded.unsqueeze(2)  # [B, 4, 1, A]
+            
+            # Call forward_batch
+            E_out = self.ebm.forward_batch(k_idx=k_vec, t_idx=t_idx.to(self.device), views=None, poses=poses, actions=a_norm_batch)
+            E = E_out[0] if isinstance(E_out, (tuple, list)) else E_out
+        else:
+            # Fallback to regular forward
+            E_out = self.ebm(k_idx=k_vec, t_idx=t_idx.to(self.device), views=None, poses=poses, actions=a_norm)
+            E = E_out[0] if isinstance(E_out, (tuple, list)) else E_out
 
         # Average over additional dimensions if present
-        if E.dim() >= 2 and E.size(0) == B:
+        if E.dim() == 2 and E.size(1) == 4:
+            # E is [B, 4] from forward_batch, take mean across 4 actions
+            E = E.mean(dim=1)  # [B]
+        elif E.dim() >= 2 and E.size(0) == B:
             E = E.mean(dim=tuple(range(1, E.dim())))
         
         # Return -β * E for log-sum-exp aggregation

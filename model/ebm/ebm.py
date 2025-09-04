@@ -4,6 +4,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import timm
 
+torch.backends.cuda.enable_flash_sdp(False)
+torch.backends.cuda.enable_math_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(False)
+
 def _rope_build_inv_freq(dim: int, base: float = 10000.0, device=None):
     return 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
 
@@ -109,15 +113,31 @@ class EBM(nn.Module):
         self.dropout = cfg.ebm.dropout
         self.use_cls = cfg.ebm.use_cls_token
         self.num_views = cfg.ebm.num_views
+
         self.state_proj = StateEncoder(self.state_dim, E, p_drop=self.dropout, depth=self.depth)
         self.action_proj = ActionEncoder(self.action_dim, E, p_drop=self.dropout, depth=self.depth)
         self.view_encoder = (ConvNeXtMultiView(self.num_views, hid=E) if self.num_views else None)
         self.temp_pos = SinusoidalPosEmb(E)
+
         if self.use_cls:
             self.cls_token = nn.Parameter(torch.randn(1, 1, E))
-        enc_layer = nn.TransformerEncoderLayer(d_model=E, nhead=self.nhead, dim_feedforward=4 * E, dropout=self.dropout, activation="gelu", batch_first=True)
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=E, nhead=self.nhead, dim_feedforward=4 * E,
+            dropout=self.dropout, activation="gelu", batch_first=True
+        )
         self.transformer = nn.TransformerEncoder(enc_layer, num_layers=self.depth)
+
         self.pool = AttentionPool(E)
+        self.pool_action = AttentionPool(E)
+        
+        # 禁用SDPA高效注意力，以支持梯度惩罚的二阶梯度计算（在所有模块创建后调用）
+        self._disable_sdpa_for_gradient_penalty()       
+
+        P = getattr(cfg.ebm, "proj_dim", E)
+        self.proj_s = nn.Sequential(nn.LayerNorm(E), nn.Linear(E, P, bias=False))
+        self.proj_a = nn.Sequential(nn.LayerNorm(E), nn.Linear(E, P, bias=False))
+
         self.energy_head = nn.Sequential(
             nn.LayerNorm(E),
             nn.Linear(E, E),
@@ -125,51 +145,115 @@ class EBM(nn.Module):
             nn.Dropout(self.dropout),
             nn.Linear(E, 1),
         )
-        self.log_temp = nn.Parameter(torch.tensor(0.0))
-        self.beta = nn.Parameter(torch.tensor(1.0))
+    
+    def _disable_sdpa_for_gradient_penalty(self):
+        def disable_sdpa_recursive(module):
+            for _, child in module.named_children():
+                if hasattr(child, '_use_sdpa'):
+                    child._use_sdpa = False
+                if hasattr(child, 'enable_nested_tensor'):
+                    child.enable_nested_tensor = False
+                disable_sdpa_recursive(child)
+        
+        disable_sdpa_recursive(self.transformer)
+        # AttentionPool使用手动实现，不需要特别处理
+        disable_sdpa_recursive(self.pool)
+        disable_sdpa_recursive(self.pool_action)
 
-    def encode_tokens(self, k_idx: torch.Tensor, t_idx: torch.Tensor, views: torch.Tensor, poses: torch.Tensor, actions: torch.Tensor):
-        # Accept actions as [B, H, A] or [B, T, H, A]; if 4D, collapse T by mean
-        if actions.dim() == 4:
-            actions = actions.mean(dim=1)
+    def encode_tokens(self, k_idx: torch.Tensor, t_idx: torch.Tensor,
+                      views: torch.Tensor, poses: torch.Tensor, actions: torch.Tensor):
         B, T, _ = actions.size()
         device = actions.device
-        x = self.action_proj(actions)
+
+        a_tokens = self.action_proj(actions)
         t_range = torch.arange(T, device=device, dtype=torch.float32)
         pos_emb = self.temp_pos(t_range).unsqueeze(0)
-        x = x + pos_emb
+        a_tokens = a_tokens + pos_emb                          # [B,T,E]
 
-        pose_tok = self.state_proj(poses).unsqueeze(1)
+        s_token = self.state_proj(poses).unsqueeze(1)          # [B,1,E]
         if self.view_encoder and views is not None:
-            img_tok = self.view_encoder(views).unsqueeze(1)
+            img_tok = self.view_encoder(views).unsqueeze(1)    # [B,1,E]
         else:
-            img_tok = torch.zeros_like(pose_tok)
-        s_token = pose_tok + img_tok
+            img_tok = torch.zeros_like(s_token)
+        s_token = s_token + img_tok                            # [B,1,E]
 
         if self.use_cls:
             cls = self.cls_token.expand(B, -1, -1)
-            seq = torch.cat([cls, s_token, x], dim=1)
+            seq = torch.cat([cls, s_token, a_tokens], dim=1)   # [B,1+1+T,E]
         else:
-            seq = torch.cat([s_token, x], dim=1)
+            seq = torch.cat([s_token, a_tokens], dim=1)        # [B,1+T,E]
 
-        y = self.transformer(seq)
-        if self.use_cls:
-            y0 = y[:, 0, :]
-        else:
-            y0 = y[:, 0, :]
-
+        y = self.transformer(seq)                              # [B,L,E]
+        y0 = y[:, 0, :]
         cos_t, sin_t = _rope_angles_from_pos(t_idx.to(y0.device), dim=self.E, base=10000.0)
         y0 = _rope_rotate_vec(y0, cos_t, sin_t)
-
         cos_k, sin_k = _rope_angles_from_pos(k_idx.to(y0.device), dim=self.E, base=10000.0)
         y0 = _rope_rotate_vec(y0, cos_k, sin_k)
 
-        pooled = self.pool(y)
+        pooled = self.pool(y)                                  # [B,E]
+        z = 0.5 * (y0 + pooled)                                # fusion 表征
 
-        z = 0.5 * (y0 + pooled)
-        return z
+        # 取 state/action 专属嵌入用于对齐损失
+        z_s = s_token.squeeze(1)                               # [B,E]
+        z_a = self.pool_action(a_tokens)                       # [B,E]
+        z_s = self.proj_s(z_s)                                 # [B,P]
+        z_a = self.proj_a(z_a)                                 # [B,P]
+        z_s = F.normalize(z_s, dim=-1)
+        z_a = F.normalize(z_a, dim=-1)
 
-    def forward(self, k_idx: torch.Tensor, t_idx: torch.Tensor, views: torch.Tensor, poses: torch.Tensor, actions: torch.Tensor):
-        z = self.encode_tokens(k_idx, t_idx, views, poses, actions)
+        return z, z_s, z_a
+
+    def forward(self, k_idx: torch.Tensor, t_idx: torch.Tensor,
+                views: torch.Tensor, poses: torch.Tensor, actions: torch.Tensor):
+        z, z_s, z_a = self.encode_tokens(k_idx, t_idx, views, poses, actions)
         en = self.energy_head(z).view(-1)
-        return en, z
+        return en, z, z_s, z_a
+    
+    def forward_batch(self, k_idx: torch.Tensor, t_idx: torch.Tensor,
+                      views: torch.Tensor, poses: torch.Tensor, actions: torch.Tensor):
+        """Process batch of 4 actions and return 4 energies.
+        
+        Args:
+            k_idx: [B] tensor of guidance step indices
+            t_idx: [B] tensor of time step indices  
+            views: [B,V,C,H,W] multi-view images or None
+            poses: [B,D_s] state/pose information
+            actions: [B,4,T,D_a] batch of 4 action sequences
+            
+        Returns:
+            energies: [B,4] tensor of 4 energy values
+            z: [B,4,E] fused representations
+            z_s: [B,4,P] state representations
+            z_a: [B,4,P] action representations
+        """
+        B, num_actions = actions.shape[0], actions.shape[1]
+        assert num_actions == 4, f"Expected 4 actions, got {num_actions}"
+        
+        # Prepare batch inputs by repeating k_idx, t_idx, views, poses for each action
+        k_idx_batch = k_idx.unsqueeze(1).repeat(1, 4).view(-1)  # [B*4]
+        t_idx_batch = t_idx.unsqueeze(1).repeat(1, 4).view(-1)  # [B*4]
+        poses_batch = poses.unsqueeze(1).repeat(1, 4, 1).view(-1, poses.shape[-1])  # [B*4, D_s]
+        
+        # Handle views if present
+        if views is not None:
+            views_batch = views.unsqueeze(1).repeat(1, 4, 1, 1, 1, 1).view(-1, *views.shape[1:])  # [B*4, V, C, H, W]
+        else:
+            views_batch = None
+            
+        # Reshape actions for batch processing
+        actions_batch = actions.view(-1, *actions.shape[2:])  # [B*4, T, D_a]
+        
+        # Process all 4 actions in parallel
+        z_batch, z_s_batch, z_a_batch = self.encode_tokens(
+            k_idx_batch, t_idx_batch, views_batch, poses_batch, actions_batch
+        )
+        
+        # Compute energies for all 4 actions
+        en_batch = self.energy_head(z_batch).view(B, 4)  # [B, 4]
+        
+        # Reshape outputs back to [B, 4, ...]
+        z = z_batch.view(B, 4, -1)  # [B, 4, E]
+        z_s = z_s_batch.view(B, 4, -1)  # [B, 4, P]
+        z_a = z_a_batch.view(B, 4, -1)  # [B, 4, P]
+        
+        return en_batch, z, z_s, z_a

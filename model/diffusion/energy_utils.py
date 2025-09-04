@@ -170,6 +170,7 @@ class KFreePotential:
         poses: torch.Tensor,
         k: int,
         A_k: torch.Tensor,
+        t: int = 0,
     ) -> torch.Tensor:
         """Return x = -β E_θ(s, a_k, k) with action normalization to [-1, 1]."""
         # Log k range validation (only once)
@@ -181,6 +182,7 @@ class KFreePotential:
         
         B = poses.size(0)
         k_vec = torch.full((B,), int(k), dtype=torch.long, device=poses.device)
+        t_vec = torch.full((B,), int(t), dtype=torch.long, device=poses.device)
 
         # Ensure actions have shape [B, H, A]
         if A_k.dim() == 2:  # [B, A]
@@ -204,12 +206,38 @@ class KFreePotential:
             log.warning(f"Action normalization failed: {e}")
             a_norm = A_k
 
-        # Compute energy
+        # Compute energy - adapt to new EBM interface
         try:
-            E_out = self.ebm(k_idx=k_vec, views=None, poses=poses, actions=a_norm)
-            E = E_out[0] if isinstance(E_out, (tuple, list)) else E_out
-            if E.dim() >= 2 and E.size(0) == B:
-                E = E.mean(dim=tuple(range(1, E.dim())))
+            # Check if EBM has forward_batch method for batch processing
+            if hasattr(self.ebm, 'forward_batch'):
+                # For forward_batch, we need [B, 4, T, A] format
+                # If we have single action [B, 1, A], we need to pad to 4 actions
+                H = a_norm.size(1)
+                if H < 4:
+                    # Pad with zeros or repeat the action to get 4 actions
+                    a_norm_padded = a_norm.repeat(1, 4, 1)[:, :4, :]  # [B, 4, A]
+                else:
+                    a_norm_padded = a_norm[:, :4, :]  # Take first 4 if more than 4
+                
+                # Add temporal dimension for EBM: [B, 4, T=1, A]
+                a_norm_batch = a_norm_padded.unsqueeze(2)  # [B, 4, 1, A]
+                
+                # Call forward_batch
+                E_out = self.ebm.forward_batch(k_idx=k_vec, t_idx=t_vec, views=None, poses=poses, actions=a_norm_batch)
+                E = E_out[0] if isinstance(E_out, (tuple, list)) else E_out
+                
+                # E should be [B, 4], we take mean across 4 actions
+                if E.dim() == 2 and E.size(1) == 4:
+                    E = E.mean(dim=1)  # [B]
+                elif E.dim() >= 2 and E.size(0) == B:
+                    E = E.mean(dim=tuple(range(1, E.dim())))
+            else:
+                # Fallback to regular forward for single action
+                # a_norm should be [B, T=1, A] for regular forward
+                E_out = self.ebm(k_idx=k_vec, t_idx=t_vec, views=None, poses=poses, actions=a_norm)
+                E = E_out[0] if isinstance(E_out, (tuple, list)) else E_out
+                if E.dim() >= 2 and E.size(0) == B:
+                    E = E.mean(dim=tuple(range(1, E.dim()))))
         except Exception as e:
             log.warning(f"EBM forward failed: {e}")
             return torch.zeros(B, device=poses.device)
@@ -217,7 +245,7 @@ class KFreePotential:
         return -self.beta * E
 
     @torch.no_grad()
-    def phi(self, obs_state: torch.Tensor) -> torch.Tensor:
+    def phi(self, obs_state: torch.Tensor, t: int = 0) -> torch.Tensor:
         """Compute φ(s) via log-mean-exp over sampled path energies exactly as in the theory."""
         # Accept [B, obs] or [B, 1, obs] or [B, T_cond, obs] -> use last cond step
         if obs_state.dim() == 3:
@@ -239,7 +267,7 @@ class KFreePotential:
                     if 0 <= k < self.K and T > 0:
                         idx = max(0, min(T - 1, T - 1 - k))
                         A_k = chain[:, idx]
-                        x = self._neg_beta_energy_from_actions(poses, k, A_k)  # [B]
+                        x = self._neg_beta_energy_from_actions(poses, k, A_k, t)  # [B]
                         x_terms.append(x)
             except Exception as e:
                 log.warning(f"Deterministic chain sampling failed: {e}")
@@ -254,7 +282,7 @@ class KFreePotential:
                         if 0 <= k < self.K and T > 0:
                             idx = max(0, min(T - 1, T - 1 - k))
                             A_k = chain[:, idx]
-                            x = self._neg_beta_energy_from_actions(poses, k, A_k)
+                            x = self._neg_beta_energy_from_actions(poses, k, A_k, t)
                             x_terms.append(x)
             except Exception as e:
                 log.warning(f"Stochastic chain sampling failed: {e}")
@@ -269,10 +297,10 @@ class KFreePotential:
         return (self.alpha / self.beta) * log_mean_exp
 
     @torch.no_grad()
-    def shape_reward(self, s_t: torch.Tensor, s_tp1: torch.Tensor, gamma: float) -> torch.Tensor:
+    def shape_reward(self, s_t: torch.Tensor, s_tp1: torch.Tensor, gamma: float, t: int = 0) -> torch.Tensor:
         """r_shape = γ φ(s') - φ(s)."""
-        phi_t = self.phi(s_t)
-        phi_tp1 = self.phi(s_tp1)
+        phi_t = self.phi(s_t, t)
+        phi_tp1 = self.phi(s_tp1, t+1)
         return gamma * phi_tp1 - phi_t
 
     def _make_zero_noise_list(self, B: int, H: int, A: int, K: int, device):

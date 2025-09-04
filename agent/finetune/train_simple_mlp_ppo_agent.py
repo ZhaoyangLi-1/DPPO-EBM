@@ -13,11 +13,109 @@ import torch
 import logging
 import wandb
 import math
-from copy import deepcopy
-
+from scipy.stats import pearsonr
 log = logging.getLogger(__name__)
 from util.timer import Timer
 from agent.finetune.train_ppo_agent import TrainPPOAgent
+
+
+class DynamicEnergyNormalizer:
+    """
+    Dynamic normalization for EBM energy values using exponential moving average
+    with temperature scaling for reward sensitivity control.
+    """
+    
+    def __init__(self, momentum=0.99, temperature=1.0, epsilon=1e-8):
+        """
+        Args:
+            momentum (float): Momentum for exponential moving average (beta in paper)
+            temperature (float): Temperature scaling parameter (tau in paper)
+            epsilon (float): Small constant for numerical stability
+        """
+        self.momentum = momentum
+        self.temperature = temperature
+        self.epsilon = epsilon
+        
+        # Running statistics
+        self.running_mean = 0.0
+        self.running_var = 1.0
+        self.num_updates = 0
+        
+        log.info(f"DynamicEnergyNormalizer initialized: momentum={momentum}, temperature={temperature}")
+    
+    def update(self, energies):
+        """
+        Update running statistics with new batch of energies.
+        
+        Args:
+            energies (np.ndarray): Batch of energy values
+            
+        Returns:
+            np.ndarray: Normalized and temperature-scaled energies
+        """
+        if len(energies) == 0:
+            return energies
+            
+        # Compute batch statistics
+        batch_mean = np.mean(energies)
+        batch_var = np.var(energies)
+        
+        # Update running statistics using exponential moving average
+        if self.num_updates == 0:
+            # First update: initialize with batch statistics
+            self.running_mean = batch_mean
+            self.running_var = batch_var
+        else:
+            # Exponential moving average update
+            self.running_mean = self.momentum * self.running_mean + (1 - self.momentum) * batch_mean
+            self.running_var = self.momentum * self.running_var + (1 - self.momentum) * batch_var
+        
+        self.num_updates += 1
+        
+        # Normalize energies: E_norm = (E - mu) / (sigma + epsilon)
+        normalized_energies = (energies - self.running_mean) / (np.sqrt(self.running_var) + self.epsilon)
+        
+        # Apply temperature scaling: E_scaled = E_norm / tau
+        scaled_energies = normalized_energies / self.temperature
+        
+        # Log statistics every 100 updates for debugging
+        if self.num_updates % 100 == 0 or self.num_updates <= 10:
+            log.info(f"EnergyNormalizer Update {self.num_updates}:")
+            log.info(f"  Batch: mean={batch_mean:.4f}, var={batch_var:.4f}")
+            log.info(f"  Running: mean={self.running_mean:.4f}, var={self.running_var:.4f}")
+            log.info(f"  Normalized range: [{normalized_energies.min():.4f}, {normalized_energies.max():.4f}]")
+            log.info(f"  Temperature-scaled range: [{scaled_energies.min():.4f}, {scaled_energies.max():.4f}]")
+        
+        return scaled_energies
+    
+    def normalize_without_update(self, energies):
+        """
+        Normalize energies using current running statistics without updating them.
+        Useful for evaluation.
+        
+        Args:
+            energies (np.ndarray): Energy values to normalize
+            
+        Returns:
+            np.ndarray: Normalized and temperature-scaled energies
+        """
+        if len(energies) == 0:
+            return energies
+            
+        normalized_energies = (energies - self.running_mean) / (np.sqrt(self.running_var) + self.epsilon)
+        scaled_energies = normalized_energies / self.temperature
+        return scaled_energies
+    
+    def get_stats(self):
+        """Get current normalization statistics."""
+        return {
+            "running_mean": self.running_mean,
+            "running_var": self.running_var,
+            "running_std": np.sqrt(self.running_var),
+            "num_updates": self.num_updates,
+            "momentum": self.momentum,
+            "temperature": self.temperature
+        }
 
 
 class TrainSimpleMLP_PPOAgent(TrainPPOAgent):
@@ -33,28 +131,64 @@ class TrainSimpleMLP_PPOAgent(TrainPPOAgent):
 
     def __init__(self, cfg):
         """Initialize the training agent with configuration."""
-        super().__init__(cfg)
-        
-        # EBM reward configuration
+        # Store EBM configuration for later setup (after device is available)
         self.use_ebm_reward = cfg.model.get("use_ebm_reward", False)
         self.ebm_reward_scale = cfg.model.get("ebm_reward_scale", 1.0)
         self.ebm_reward_clip_max = cfg.model.get("ebm_reward_clip_max", 10.0)
+        self.use_auto_scaling = cfg.model.get("use_auto_scaling", False)  # Disabled by default
         
-        # EBM model setup
+        # Dynamic normalization parameters
+        self.use_dynamic_normalization = cfg.model.get("use_dynamic_normalization", True)
+        self.normalization_momentum = cfg.model.get("normalization_momentum", 0.99)
+        self.temperature_scale = cfg.model.get("temperature_scale", 1.0)
+        self.normalization_epsilon = cfg.model.get("normalization_epsilon", 1e-8)
+        
         self.ebm_model = None
-        if self.use_ebm_reward:
-            self._setup_ebm_model(cfg)
+        self.energy_normalizer = None
         
-        log.info(f"SimpleMLP PPO Agent initialized with use_ebm_reward={self.use_ebm_reward}")
+        # Call parent initialization first - this sets up self.device and creates main model
+        super().__init__(cfg)
+        
+        # NOW setup EBM model (after device is available)
+        if self.use_ebm_reward:
+            log.info("🔄 Setting up EBM model after parent initialization...")
+            self._setup_ebm_model(cfg)
+            
+            # Initialize dynamic energy normalizer if enabled
+            if self.use_dynamic_normalization:
+                self.energy_normalizer = DynamicEnergyNormalizer(
+                    momentum=self.normalization_momentum,
+                    temperature=self.temperature_scale,
+                    epsilon=self.normalization_epsilon
+                )
+                log.info("🌡️  Dynamic energy normalizer initialized")
+            
+            # Link EBM to main model
+            if self.ebm_model is not None and hasattr(self.model, 'set_ebm_model'):
+                self.model.set_ebm_model(self.ebm_model)
+                log.info("🔗 EBM model linked to main PPO model")
+        
+        # Final status check
+        if self.use_ebm_reward and self.ebm_model is None:
+            log.error("💥 CRITICAL: use_ebm_reward=True but EBM model failed to load!")
+            log.error("💥 This will cause the 'no EBM model provided' warning during training")
+        
+        log.info(f"SimpleMLP PPO Agent initialized with use_ebm_reward={self.use_ebm_reward}, ebm_model_loaded={self.ebm_model is not None}")
 
     def _setup_ebm_model(self, cfg):
         """Set up EBM model for reward computation."""
+        log.info(f"🔧 Setting up EBM model with use_ebm_reward={self.use_ebm_reward}")
+        
         try:
             # Import EBM model
+            log.info("📦 Importing EBM model...")
             from model.ebm.ebm import EBM
+            log.info("✅ EBM import successful")
             
             # Create EBM model
             ebm_cfg = cfg.model.ebm
+            log.info(f"🏗️  Creating EBM with config: embed_dim={ebm_cfg.get('embed_dim', 256)}, state_dim={cfg.obs_dim}, action_dim={cfg.action_dim}")
+            
             self.ebm_model = EBM(cfg=type('EBMConfig', (), {
                 'ebm': type('EBMSubConfig', (), {
                     'embed_dim': ebm_cfg.get('embed_dim', 256),
@@ -67,22 +201,33 @@ class TrainSimpleMLP_PPOAgent(TrainPPOAgent):
                     'num_views': ebm_cfg.get('num_views', None),
                 })()
             })()).to(self.device)
+            log.info("✅ EBM model created successfully")
             
             # Load EBM checkpoint if provided
             ebm_ckpt_path = cfg.model.get('ebm_ckpt_path', None)
+            log.info(f"🔍 Looking for EBM checkpoint at: {ebm_ckpt_path}")
+            
             if ebm_ckpt_path and os.path.exists(ebm_ckpt_path):
                 try:
+                    log.info(f"📂 Loading checkpoint from {ebm_ckpt_path}")
                     checkpoint = torch.load(ebm_ckpt_path, map_location=self.device)
+                    log.info(f"📋 Checkpoint keys: {list(checkpoint.keys())}")
+                    
                     if "model" in checkpoint:
                         self.ebm_model.load_state_dict(checkpoint["model"])
+                        log.info("✅ Loaded EBM state dict from checkpoint['model']")
                     else:
                         self.ebm_model.load_state_dict(checkpoint)
-                    log.info(f"Loaded EBM checkpoint from {ebm_ckpt_path}")
+                        log.info("✅ Loaded EBM state dict directly from checkpoint")
+                    
+                    log.info(f"🎯 Successfully loaded EBM checkpoint from {ebm_ckpt_path}")
                 except Exception as e:
-                    log.warning(f"Failed to load EBM checkpoint: {e}")
+                    log.error(f"❌ Failed to load EBM checkpoint: {e}")
+                    log.error(f"❌ Checkpoint path was: {ebm_ckpt_path}")
                     self.ebm_model = None
             else:
-                log.warning(f"EBM checkpoint path not found: {ebm_ckpt_path}")
+                log.error(f"❌ EBM checkpoint path not found or doesn't exist: {ebm_ckpt_path}")
+                log.error(f"❌ Path exists check: {os.path.exists(ebm_ckpt_path) if ebm_ckpt_path else 'None path'}")
                 self.ebm_model = None
             
             # Freeze EBM model
@@ -90,24 +235,46 @@ class TrainSimpleMLP_PPOAgent(TrainPPOAgent):
                 for param in self.ebm_model.parameters():
                     param.requires_grad = False
                 self.ebm_model.eval()
+                log.info("🔒 EBM model frozen and set to eval mode")
                 
                 # Set EBM model in the PPO model
-                self.model.set_ebm_model(self.ebm_model)
+                if hasattr(self.model, 'set_ebm_model'):
+                    self.model.set_ebm_model(self.ebm_model)
+                    log.info("🔗 EBM model linked to PPO model")
+                else:
+                    log.warning("⚠️  PPO model doesn't have set_ebm_model method")
+                
+                log.info("🎉 EBM model setup completed successfully!")
+            else:
+                log.error("💥 EBM model setup failed - model is None")
                 
         except ImportError as e:
-            log.error(f"Failed to import EBM model: {e}")
+            log.error(f"❌ Failed to import EBM model: {e}")
+            log.error(f"❌ Make sure the EBM module is in the correct path")
             self.ebm_model = None
         except Exception as e:
-            log.error(f"Failed to setup EBM model: {e}")
+            log.error(f"❌ Failed to setup EBM model: {e}")
+            import traceback
+            log.error(f"❌ Full traceback: {traceback.format_exc()}")
             self.ebm_model = None
 
-    def _compute_ebm_rewards(self, obs_trajs, samples_trajs):
+    def _compute_ebm_rewards(self, obs_trajs, samples_trajs, firsts_trajs=None, env_reward_trajs=None, eval_mode=False):
         """
-        Compute EBM rewards for trajectory data.
+        Compute EBM rewards for trajectory data with dynamic normalization and temperature scaling.
+        
+        The method applies the following transformations:
+        1. Compute raw EBM energies for state-action pairs
+        2. Apply dynamic normalization using exponential moving average:
+           E_norm = (E - μ_t) / (σ_t + ε)
+        3. Apply temperature scaling: E_scaled = E_norm / τ
+        4. Convert to rewards: reward = -E_scaled (lower energy = higher reward)
         
         Args:
             obs_trajs: Observation trajectories dict with 'state' key
             samples_trajs: Action trajectories
+            firsts_trajs: [n_steps+1, n_envs] Episode start indicators (optional)
+            env_reward_trajs: [n_steps, n_envs] Environment rewards (optional, for logging)
+            eval_mode: If True, don't update running normalization statistics
             
         Returns:
             EBM rewards array [n_steps, n_envs]
@@ -116,6 +283,17 @@ class TrainSimpleMLP_PPOAgent(TrainPPOAgent):
             return np.zeros((self.n_steps, self.n_envs))
         
         ebm_rewards = np.zeros((self.n_steps, self.n_envs))
+        
+        # Initialize environment step counters for each environment
+        # This tracks the actual timestep within each episode
+        env_step_counters = np.zeros(self.n_envs, dtype=int)
+        
+        # If firsts_trajs is provided, use it to track episode resets
+        if firsts_trajs is not None:
+            # firsts_trajs[0] indicates which envs started fresh episodes
+            env_step_counters = (1 - firsts_trajs[0]).astype(int) * env_step_counters
+        
+        # No auto-scaling - removed raw reward collection
         
         try:
             with torch.no_grad():
@@ -128,8 +306,8 @@ class TrainSimpleMLP_PPOAgent(TrainPPOAgent):
                     
                     # Create default indices
                     B = self.n_envs
+                    # k_idx=0 for Simple MLP PPO (no diffusion/denoising process)
                     k_idx = torch.zeros(B, device=self.device, dtype=torch.long)
-                    t_idx = torch.full((B,), step, device=self.device, dtype=torch.long)
                     
                     # Extract state features (take last observation if sequence)
                     states = batch_obs['state']  # [n_envs, cond_steps, obs_dim]
@@ -138,21 +316,78 @@ class TrainSimpleMLP_PPOAgent(TrainPPOAgent):
                     
                     # Compute EBM energies
                     try:
-                        energies, _ = self.ebm_model(
+                        # t_idx represents environment time step within current episode
+                        # Use actual environment timestep counters for each environment
+                        env_t_idx = torch.from_numpy(env_step_counters).long().to(self.device)
+                        
+                        # Update step counters for next iteration
+                        # Reset counter when episode starts (firsts_trajs[step+1] == 1)
+                        if firsts_trajs is not None and step < len(firsts_trajs) - 1:
+                            # Reset counters for environments that will start new episodes
+                            reset_mask = firsts_trajs[step + 1].astype(bool)
+                            env_step_counters[reset_mask] = 0
+                        # Increment all counters
+                        env_step_counters += 1
+                        
+                        if step == 0:
+                            log.info(f"t_idx range: {env_t_idx.min().item()} to {env_t_idx.max().item()}")
+                        elif step < 3:
+                            log.info(f"Step {step}: t_idx range [{env_t_idx.min().item()}, {env_t_idx.max().item()}], mean {env_t_idx.float().mean().item():.1f}")
+                        
+                        # Use EBM forward method for single action evaluation
+                        if step == 0:
+                            log.info(f"Using EBM forward: actions shape {batch_actions.shape}")
+                        
+                        ebm_output = self.ebm_model(
                             k_idx=k_idx,
-                            t_idx=t_idx,
+                            t_idx=env_t_idx,
                             views=None,  # No vision for simple baseline
                             poses=states,  # [n_envs, obs_dim]
                             actions=batch_actions  # [n_envs, horizon_steps, action_dim]
                         )
                         
-                        # Convert to rewards and apply scaling
-                        rewards = energies.cpu().numpy() * self.ebm_reward_scale
+                        # EBM forward returns (energies, z, z_s, z_a)
+                        if isinstance(ebm_output, tuple) and len(ebm_output) >= 1:
+                            energies = ebm_output[0]
+                            if step == 0:
+                                log.info(f"EBM forward output: tuple with {len(ebm_output)} elements, energies shape {energies.shape}")
+                        else:
+                            log.error(f"Unexpected EBM output format: {type(ebm_output)}")
+                            energies = torch.zeros(B, device=self.device)
                         
-                        # Clip rewards for stability
-                        rewards = np.clip(rewards, -self.ebm_reward_clip_max, self.ebm_reward_clip_max)
+                        # Get raw energies (before sign flip)
+                        raw_energies = energies.cpu().numpy()
                         
-                        ebm_rewards[step] = rewards
+                        # Apply dynamic normalization if enabled
+                        if self.use_dynamic_normalization and self.energy_normalizer is not None:
+                            # Normalize energies using dynamic statistics
+                            # Note: we normalize the raw energies, then flip sign for rewards
+                            if eval_mode:
+                                # During evaluation, don't update running statistics
+                                normalized_energies = self.energy_normalizer.normalize_without_update(raw_energies)
+                            else:
+                                # During training, update running statistics
+                                normalized_energies = self.energy_normalizer.update(raw_energies)
+                            # Convert to rewards: Lower normalized energy = Higher reward
+                            ebm_step_rewards = -normalized_energies
+                        else:
+                            # Fallback: simple sign flip without normalization
+                            ebm_step_rewards = -raw_energies
+                        
+                        # Debug: log statistics for first few steps
+                        if step < 3:
+                            log.info(f"Step {step}: EBM energies (raw) range [{raw_energies.min():.3f}, {raw_energies.max():.3f}], mean {raw_energies.mean():.3f}")
+                            if self.use_dynamic_normalization and self.energy_normalizer is not None:
+                                log.info(f"Step {step}: EBM rewards (normalized, -E) range [{ebm_step_rewards.min():.3f}, {ebm_step_rewards.max():.3f}], mean {ebm_step_rewards.mean():.3f}")
+                                # Log normalizer stats
+                                if step == 0:
+                                    stats = self.energy_normalizer.get_stats()
+                                    log.info(f"Normalizer stats: mean={stats['running_mean']:.4f}, std={stats['running_std']:.4f}, temp={stats['temperature']:.4f}")
+                            else:
+                                log.info(f"Step {step}: EBM rewards (-energy, raw) range [{ebm_step_rewards.min():.3f}, {ebm_step_rewards.max():.3f}], mean {ebm_step_rewards.mean():.3f}")
+                        
+                        # Store rewards
+                        ebm_rewards[step] = ebm_step_rewards
                         
                     except Exception as e:
                         log.warning(f"EBM computation failed at step {step}: {e}")
@@ -161,7 +396,74 @@ class TrainSimpleMLP_PPOAgent(TrainPPOAgent):
         except Exception as e:
             log.error(f"Failed to compute EBM rewards: {e}")
             
+        # Apply scaling based on configuration
+        if self.use_dynamic_normalization and self.energy_normalizer is not None:
+            log.info("🌡️  Using dynamic normalization (temperature scaling included)")
+            # Dynamic normalization already includes temperature scaling, 
+            # but we still apply manual scaling for fine-tuning
+            ebm_rewards = ebm_rewards * self.ebm_reward_scale
+        else:
+            log.info("🔧 Using manual scaling only (no dynamic normalization)")
+            ebm_rewards = ebm_rewards * self.ebm_reward_scale
+        
+        # Apply clipping
+        ebm_rewards = np.clip(ebm_rewards, -self.ebm_reward_clip_max, self.ebm_reward_clip_max)
+        
+        log.info(f"📊 Final EBM rewards: range [{ebm_rewards.min():.3f}, {ebm_rewards.max():.3f}], mean {ebm_rewards.mean():.3f}")
+            
         return ebm_rewards
+    
+    def _compute_auto_scale(self, ebm_rewards, env_rewards):
+        """
+        Compute automatic scaling factor to match EBM and environment reward scales.
+        
+        Args:
+            ebm_rewards: List of raw EBM rewards (already sign-flipped)
+            env_rewards: List of environment rewards
+            
+        Returns:
+            float: Auto-scaling factor
+        """
+        ebm_array = np.array(ebm_rewards)
+        env_array = np.array(env_rewards)
+        
+        # Method 1: Match standard deviations
+        ebm_std = np.std(ebm_array)
+        env_std = np.std(env_array)
+        
+        if ebm_std > 1e-8:  # Avoid division by zero
+            std_scale = env_std / ebm_std
+        else:
+            std_scale = 1.0
+        
+        # Method 2: Match value ranges (more robust)
+        ebm_range = np.max(ebm_array) - np.min(ebm_array)
+        env_range = np.max(env_array) - np.min(env_array)
+        
+        if ebm_range > 1e-8:
+            range_scale = env_range / ebm_range
+        else:
+            range_scale = 1.0
+        
+        # Method 3: Match 90th percentiles (most robust against outliers)
+        ebm_90 = np.percentile(np.abs(ebm_array), 90)
+        env_90 = np.percentile(np.abs(env_array), 90)
+        
+        if ebm_90 > 1e-8:
+            percentile_scale = env_90 / ebm_90
+        else:
+            percentile_scale = 1.0
+        
+        # Use weighted average of the three methods
+        # Favor percentile method as it's most robust
+        auto_scale = 0.6 * percentile_scale + 0.3 * std_scale + 0.1 * range_scale
+        
+        # Apply conservative bounds to prevent extreme scaling
+        auto_scale = np.clip(auto_scale, 0.01, 100.0)
+        
+        log.info(f"🔧 Auto-scale components: std={std_scale:.4f}, range={range_scale:.4f}, p90={percentile_scale:.4f}")
+        
+        return auto_scale
 
     def run(self):
         """Main training loop with EBM reward support."""
@@ -214,6 +516,9 @@ class TrainSimpleMLP_PPOAgent(TrainPPOAgent):
                     (obs_full_trajs, prev_obs_venv["state"][:, -1][None])
                 )
             
+            # Initialize detailed reward tracking
+            raw_env_rewards = []
+            
             # Collect trajectories
             for step in range(self.n_steps):
                 if step % 10 == 0:
@@ -239,6 +544,9 @@ class TrainSimpleMLP_PPOAgent(TrainPPOAgent):
                 )
                 done_venv = terminated_venv | truncated_venv
                 
+                # Store raw environment reward for detailed logging
+                raw_env_rewards.append(reward_venv.copy())
+                
                 if self.save_full_observations:
                     obs_full_venv = np.array(
                         [info["full_obs"]["state"] for info in info_venv]
@@ -258,6 +566,9 @@ class TrainSimpleMLP_PPOAgent(TrainPPOAgent):
                 prev_obs_venv = obs_venv
                 cnt_train_step += self.n_envs * self.act_steps if not eval_mode else 0
             
+            # Store original environment rewards before any EBM modification (for logging)
+            original_reward_trajs = reward_trajs.copy()
+            
             # Compute episode rewards and statistics
             episodes_start_end = []
             for env_ind in range(self.n_envs):
@@ -268,10 +579,22 @@ class TrainSimpleMLP_PPOAgent(TrainPPOAgent):
                     if end - start > 1:
                         episodes_start_end.append((env_ind, start, end - 1))
             
+            # Compute detailed reward statistics
+            raw_env_rewards_array = np.array(raw_env_rewards)  # [n_steps, n_envs]
+            
+            # Basic reward statistics for current iteration
+            raw_reward_stats = {
+                "mean": float(np.mean(raw_env_rewards_array)),
+                "std": float(np.std(raw_env_rewards_array)),
+                "min": float(np.min(raw_env_rewards_array)),
+                "max": float(np.max(raw_env_rewards_array)),
+                "median": float(np.median(raw_env_rewards_array)),
+            }
+            
             if len(episodes_start_end) > 0:
-                # ALWAYS compute environment reward stats for logging (before EBM replacement)
+                # ALWAYS compute environment reward stats for logging (use pure environment rewards)
                 env_reward_trajs_split = [
-                    reward_trajs[start : end + 1, env_ind]
+                    original_reward_trajs[start : end + 1, env_ind]
                     for env_ind, start, end in episodes_start_end
                 ]
                 num_episode_finished = len(env_reward_trajs_split)
@@ -297,12 +620,26 @@ class TrainSimpleMLP_PPOAgent(TrainPPOAgent):
                 success_rate = np.mean(
                     episode_best_reward >= self.best_reward_threshold_for_success
                 )
+                
+                # Additional episode statistics
+                episode_stats = {
+                    "mean": float(avg_episode_reward),
+                    "std": float(np.std(env_episode_reward)) if len(env_episode_reward) > 1 else 0.0,
+                    "min": float(np.min(env_episode_reward)),
+                    "max": float(np.max(env_episode_reward)),
+                    "median": float(np.median(env_episode_reward)),
+                    "count": num_episode_finished,
+                    "avg_length": float(np.mean([end - start + 1 for _, start, end in episodes_start_end]))
+                }
             else:
-                episode_reward = np.array([])
                 num_episode_finished = 0
                 avg_episode_reward = 0
                 avg_best_reward = 0
                 success_rate = 0
+                episode_stats = {
+                    "mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0, "median": 0.0, 
+                    "count": 0, "avg_length": 0.0
+                }
                 log.info("[WARNING] No episode completed within the iteration!")
             
             # Update models
@@ -313,14 +650,72 @@ class TrainSimpleMLP_PPOAgent(TrainPPOAgent):
                 )
                 
                 # Optionally replace environment rewards with EBM rewards
+                ebm_reward_stats = None
+                reward_correlation = None
                 if self.use_ebm_reward:
-                    log.info(f"Computing EBM rewards for iteration {self.itr}")
-                    ebm_rewards = self._compute_ebm_rewards(obs_trajs, samples_trajs)
-                    # Store EBM reward stats for wandb logging
-                    self._last_ebm_reward_mean = np.mean(ebm_rewards)
-                    self._last_ebm_reward_std = np.std(ebm_rewards)
-                    reward_trajs = ebm_rewards
-                    log.info(f"EBM reward stats: mean={self._last_ebm_reward_mean:.4f}, std={self._last_ebm_reward_std:.4f}")
+                    # Quick EBM model health check
+                    if self.ebm_model is None:
+                        log.error("❌ EBM model is None - no EBM rewards will be computed!")
+                        reward_trajs = original_reward_trajs  # Fall back to env rewards
+                    elif not hasattr(self.ebm_model, 'forward') and not hasattr(self.ebm_model, '__call__'):
+                        log.error("❌ EBM model doesn't have forward method!")
+                        reward_trajs = original_reward_trajs
+                    else:
+                        log.info(f"Computing EBM rewards for iteration {self.itr} (eval_mode={eval_mode})")
+                        ebm_rewards = self._compute_ebm_rewards(obs_trajs, samples_trajs, firsts_trajs, original_reward_trajs, eval_mode)
+                        
+                        # Store EBM reward stats for wandb logging
+                        self._last_ebm_reward_mean = np.mean(ebm_rewards)
+                        self._last_ebm_reward_std = np.std(ebm_rewards)
+                        ebm_reward_stats = {
+                            "mean": float(self._last_ebm_reward_mean),
+                            "std": float(self._last_ebm_reward_std),
+                            "min": float(np.min(ebm_rewards)),
+                            "max": float(np.max(ebm_rewards)),
+                            "median": float(np.median(ebm_rewards))
+                        }
+                        
+                        # Analyze correlation between EBM and environment rewards
+                        try:
+                            env_flat = original_reward_trajs.flatten()
+                            ebm_flat = ebm_rewards.flatten()
+                            if len(env_flat) > 10:  # Need sufficient data for correlation
+                                correlation, p_value = pearsonr(env_flat, ebm_flat)
+                                reward_correlation = {
+                                    "pearson_r": float(correlation),
+                                    "p_value": float(p_value),
+                                    "env_mean": float(np.mean(env_flat)),
+                                    "ebm_mean": float(np.mean(ebm_flat)),
+                                    "sample_size": len(env_flat)
+                                }
+                                log.info(f"EBM-ENV reward correlation: r={correlation:.4f} (p={p_value:.4f})")
+                                
+                                # Adaptive EBM weighting based on correlation
+                                if correlation > 0.3 and p_value < 0.01:
+                                    ebm_weight = 0.5  # Strong positive correlation: trust EBM more
+                                    log.info("✅ Strong positive correlation - using 50% EBM weight")
+                                elif correlation > 0.0:
+                                    ebm_weight = 0.2  # Weak positive correlation: use EBM conservatively
+                                    log.info("⚖️  Weak positive correlation - using 20% EBM weight")
+                                else:
+                                    ebm_weight = 0.0  # Negative correlation: ignore EBM
+                                    log.warning("❌ Negative correlation - ignoring EBM rewards!")
+                                
+                                # Mix rewards based on adaptive weight
+                                mixed_rewards = (1.0 - ebm_weight) * original_reward_trajs + ebm_weight * ebm_rewards
+                                log.info(f"🔄 Mixed rewards: {ebm_weight*100:.0f}% EBM + {(1-ebm_weight)*100:.0f}% ENV")
+                                
+                                if abs(correlation) < 0.1:
+                                    log.warning("⚠️  Very weak correlation between EBM and environment rewards!")
+                                elif correlation < -0.3:
+                                    log.warning("⚠️  Strong negative correlation - EBM may be counterproductive!")
+                        except Exception as e:
+                            log.warning(f"Failed to compute reward correlation: {e}")
+                            mixed_rewards = original_reward_trajs  # Fallback to env rewards
+                            ebm_weight = 0.0
+                        
+                        reward_trajs = mixed_rewards
+                        log.info(f"EBM reward stats: mean={self._last_ebm_reward_mean:.4f}, std={self._last_ebm_reward_std:.4f}")
                 
                 # Calculate values and logprobs in batches
                 num_split = math.ceil(
@@ -356,12 +751,28 @@ class TrainSimpleMLP_PPOAgent(TrainPPOAgent):
                         (logprobs_trajs, logprobs.reshape(-1))
                     )
                 
+                # Track rewards before scaling for comparison
+                reward_before_scaling = reward_trajs.copy()
+                scaling_stats = None
+                
                 # Normalize rewards with running variance if specified
                 if self.reward_scale_running:
                     reward_trajs_transpose = self.running_reward_scaler(
                         reward=reward_trajs.T, first=firsts_trajs[:-1].T
                     )
                     reward_trajs = reward_trajs_transpose.T
+                    
+                    # Compute scaling statistics
+                    scaling_factor = np.mean(reward_trajs) / (np.mean(reward_before_scaling) + 1e-8)
+                    scaling_stats = {
+                        "before_mean": float(np.mean(reward_before_scaling)),
+                        "before_std": float(np.std(reward_before_scaling)),
+                        "after_mean": float(np.mean(reward_trajs)),
+                        "after_std": float(np.std(reward_trajs)),
+                        "scaling_factor": float(scaling_factor),
+                        "scaler_mean": float(getattr(self.running_reward_scaler, 'mean', 0.0)),
+                        "scaler_var": float(getattr(self.running_reward_scaler, 'var', 1.0))
+                    }
                 
                 # Bootstrap value with GAE
                 obs_venv_ts = {
@@ -539,12 +950,27 @@ class TrainSimpleMLP_PPOAgent(TrainPPOAgent):
                     log.info(
                         f"eval: success rate {success_rate:8.4f} | avg episode reward {avg_episode_reward:8.4f} | avg best reward {avg_best_reward:8.4f}"
                     )
+                    log.info(
+                        f"eval rewards: raw_mean {raw_reward_stats['mean']:.4f} ± {raw_reward_stats['std']:.4f} | episodes: {num_episode_finished} | avg_len: {episode_stats['avg_length']:.1f}"
+                    )
                     if self.use_wandb:
                         log_dict = {
                             "success rate - eval": success_rate,
                             "avg episode reward - eval (ENV)": avg_episode_reward,  # Always environment reward
                             "avg best reward - eval": avg_best_reward,
                             "num episode - eval": num_episode_finished,
+                            # Raw step reward statistics
+                            "eval/raw_reward_mean": raw_reward_stats["mean"],
+                            "eval/raw_reward_std": raw_reward_stats["std"],
+                            "eval/raw_reward_min": raw_reward_stats["min"],
+                            "eval/raw_reward_max": raw_reward_stats["max"],
+                            "eval/raw_reward_median": raw_reward_stats["median"],
+                            # Episode statistics
+                            "eval/episode_reward_std": episode_stats["std"],
+                            "eval/episode_reward_min": episode_stats["min"],
+                            "eval/episode_reward_max": episode_stats["max"],
+                            "eval/episode_reward_median": episode_stats["median"],
+                            "eval/avg_episode_length": episode_stats["avg_length"],
                         }
                         if self.use_ebm_reward:
                             log_dict["evaluation_reward_type"] = "Environment_only"
@@ -558,6 +984,17 @@ class TrainSimpleMLP_PPOAgent(TrainPPOAgent):
                     log.info(
                         f"{self.itr}: step {cnt_train_step:8d} | loss {loss:8.4f} | pg loss {pg_loss:8.4f} | value loss {v_loss:8.4f} | ent {-entropy_loss:8.4f} | reward {avg_episode_reward:8.4f} | t:{time:8.4f}"
                     )
+                    log.info(
+                        f"train rewards: raw_mean {raw_reward_stats['mean']:.4f} ± {raw_reward_stats['std']:.4f} | episodes: {num_episode_finished} | avg_len: {episode_stats['avg_length']:.1f}"
+                    )
+                    if scaling_stats is not None:
+                        log.info(
+                            f"reward scaling: {scaling_stats['before_mean']:.4f} -> {scaling_stats['after_mean']:.4f} (factor: {scaling_stats['scaling_factor']:.4f})"
+                        )
+                    if self.use_ebm_reward and ebm_reward_stats is not None:
+                        log.info(
+                            f"EBM rewards: mean {ebm_reward_stats['mean']:.4f} ± {ebm_reward_stats['std']:.4f} (scale: {self.ebm_reward_scale})"
+                        )
                     if self.use_wandb:
                         log_dict = {
                             "total env step": cnt_train_step,
@@ -572,18 +1009,74 @@ class TrainSimpleMLP_PPOAgent(TrainPPOAgent):
                             "explained variance": explained_var,
                             "avg episode reward - train (ENV)": avg_episode_reward,  # Always environment reward
                             "num episode - train": num_episode_finished,
+                            # Raw step reward statistics
+                            "train/raw_reward_mean": raw_reward_stats["mean"],
+                            "train/raw_reward_std": raw_reward_stats["std"],
+                            "train/raw_reward_min": raw_reward_stats["min"],
+                            "train/raw_reward_max": raw_reward_stats["max"],
+                            "train/raw_reward_median": raw_reward_stats["median"],
+                            # Episode statistics
+                            "train/episode_reward_std": episode_stats["std"],
+                            "train/episode_reward_min": episode_stats["min"],
+                            "train/episode_reward_max": episode_stats["max"],
+                            "train/episode_reward_median": episode_stats["median"],
+                            "train/avg_episode_length": episode_stats["avg_length"],
+                            # Reward scaling information
+                            "train/reward_scale_const": self.reward_scale_const,
                         }
-                        if self.use_ebm_reward:
-                            log_dict["training_reward_type"] = "EBM_guided"
-                            log_dict["logging_reward_type"] = "Environment"
-                            log_dict["ebm_reward_scale"] = self.ebm_reward_scale
-                            # Optionally log EBM reward stats if available
-                            if hasattr(self, '_last_ebm_reward_mean'):
-                                log_dict["ebm_reward_mean"] = self._last_ebm_reward_mean
-                                log_dict["ebm_reward_std"] = self._last_ebm_reward_std
+                        
+                        # Add EBM reward statistics if using EBM rewards
+                        if self.use_ebm_reward and ebm_reward_stats is not None:
+                            reward_type = "EBM_dynamic_norm" if self.use_dynamic_normalization else "EBM_guided"
+                            log_dict.update({
+                                "training_reward_type": reward_type,
+                                "logging_reward_type": "Environment",
+                                "ebm_reward_scale": self.ebm_reward_scale,
+                                "train/ebm_reward_mean": ebm_reward_stats["mean"],
+                                "train/ebm_reward_std": ebm_reward_stats["std"],
+                                "train/ebm_reward_min": ebm_reward_stats["min"],
+                                "train/ebm_reward_max": ebm_reward_stats["max"],
+                                "train/ebm_reward_median": ebm_reward_stats["median"],
+                            })
+                            
+                            # Add dynamic normalization statistics
+                            if self.use_dynamic_normalization and self.energy_normalizer is not None:
+                                norm_stats = self.energy_normalizer.get_stats()
+                                log_dict.update({
+                                    "train/energy_running_mean": norm_stats["running_mean"],
+                                    "train/energy_running_std": norm_stats["running_std"],
+                                    "train/energy_num_updates": norm_stats["num_updates"],
+                                    "train/temperature_scale": norm_stats["temperature"],
+                                    "train/normalization_momentum": norm_stats["momentum"],
+                                })
+                            # Add reward correlation analysis
+                            if reward_correlation is not None:
+                                log_dict.update({
+                                    "train/ebm_env_correlation": reward_correlation["pearson_r"],
+                                    "train/correlation_p_value": reward_correlation["p_value"],
+                                    "train/correlation_sample_size": reward_correlation["sample_size"],
+                                })
                         else:
-                            log_dict["training_reward_type"] = "Environment"
-                            log_dict["logging_reward_type"] = "Environment"
+                            log_dict.update({
+                                "training_reward_type": "Environment",
+                                "logging_reward_type": "Environment",
+                            })
+                        
+                        # Add reward scaling statistics if scaling is enabled
+                        if scaling_stats is not None:
+                            log_dict.update({
+                                "train/reward_scaling_enabled": True,
+                                "train/reward_before_scaling_mean": scaling_stats["before_mean"],
+                                "train/reward_before_scaling_std": scaling_stats["before_std"],
+                                "train/reward_after_scaling_mean": scaling_stats["after_mean"],
+                                "train/reward_after_scaling_std": scaling_stats["after_std"],
+                                "train/reward_scaling_factor": scaling_stats["scaling_factor"],
+                                "train/running_scaler_mean": scaling_stats["scaler_mean"],
+                                "train/running_scaler_var": scaling_stats["scaler_var"],
+                            })
+                        else:
+                            log_dict["train/reward_scaling_enabled"] = False
+                        
                         wandb.log(log_dict, step=self.itr, commit=True)
                     run_results[-1]["train_episode_reward"] = avg_episode_reward
                 

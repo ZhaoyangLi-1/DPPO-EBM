@@ -2,13 +2,16 @@ defaults:
   - _self_
 
 hydra:
-  run:
+  run:  
     dir: ${logdir}
 
-_target_: agent.finetune.train_simple_mlp_ppo_agent.TrainSimpleMLP_PPOAgent
+_target_: agent.finetune.eval.eval_simple_ppo_agent.EvalSimplePPOAgent
 
-name: ${env_name}_simple_mlp_ppo_env_ta${horizon_steps}
-logdir: ${oc.env:DPPO_LOG_DIR,${hydra:runtime.cwd}/log}/gym-finetune/${name}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
+name: ${env_name}_eval_simple_ppo_env_ta${horizon_steps}
+logdir: ${oc.env:DPPO_LOG_DIR}/gym-eval/${name}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
+
+# Model checkpoint path - UPDATE THIS to your trained model
+model_path: ${oc.env:DPPO_LOG_DIR}/gym-finetune/hopper-medium-v2_simple_mlp_ppo_env_ta4/YOUR_EXPERIMENT_DATE/checkpoint/state_199.pt
 
 seed: 42
 device: cuda:0
@@ -19,13 +22,18 @@ cond_steps: 1
 horizon_steps: 4
 act_steps: 4
 
+# Evaluation configuration
+n_steps: 5000  # Total evaluation steps
+render_num: 0  # Number of environments to render
+use_ebm_reward: False  # Environment rewards only
+
 env:
   n_envs: 40
   name: ${env_name}
   max_episode_steps: 1000
   reset_at_iteration: False
   save_video: False
-  best_reward_threshold_for_success: 3600  # success rate not relevant for gym tasks
+  best_reward_threshold_for_success: 3600  # For success rate calculation
   wrappers:
     mujoco_locomotion_lowdim:
       normalization_path: ${oc.env:DPPO_DATA_DIR,${hydra:runtime.cwd}/data}/gym/${env_name}/normalization.npz
@@ -35,47 +43,7 @@ env:
       max_episode_steps: ${env.max_episode_steps}
       reset_within_step: True
 
-# wandb: null
-wandb:
-  entity: ${oc.env:DPPO_WANDB_ENTITY}
-  project: gym-${env_name}-finetune-simple-ppo
-  run: ${name}_SimpleMLP_PPO_Env
-  group: ${oc.env:WANDB_GROUP,${env_name}-simple-ppo-baseline}
-  tags: [SimpleMLP, PPO, Env_Reward]
-
-train:
-  n_train_itr: 200
-  n_critic_warmup_itr: 0
-  n_steps: 500
-  gamma: 0.99
-  actor_lr: 3e-4
-  actor_weight_decay: 0
-  actor_lr_scheduler:
-    first_cycle_steps: 1000
-    warmup_steps: 10
-    min_lr: 5e-6
-  critic_lr: 1e-3
-  critic_weight_decay: 0
-  critic_lr_scheduler:
-    first_cycle_steps: 1000
-    warmup_steps: 10
-    min_lr: 1e-3
-  save_model_freq: 50
-  val_freq: 10
-  log_freq: 1  # Log every iteration for detailed reward tracking
-  render:
-    freq: 50
-    num: 0
-  # PPO specific
-  reward_scale_running: True
-  reward_scale_const: 1.0
-  gae_lambda: 0.95
-  batch_size: 20000
-  update_epochs: 5
-  vf_coef: 0.5
-  target_kl: 0.05
-
-
+# Model configuration - should match training config
 model:
   _target_: model.rl.simple_mlp_ppo.SimpleMLP_PPO
   
@@ -84,20 +52,11 @@ model:
   clip_vloss_coef: 0.2
   norm_adv: True
   
-  # Reward configuration - USE ENVIRONMENT REWARD
+  # Reward configuration - Environment only
   use_ebm_reward: False
   ebm_reward_scale: 1.0
   ebm_reward_clip_max: 60.0
   use_auto_scaling: False
-  
-  # EBM configuration (not used but required for structure)
-  ebm:
-    embed_dim: 256
-    nhead: 8
-    depth: 4
-    dropout: 0.0
-    use_cls_token: False
-    num_views: null
   
   # Network configuration
   actor:
@@ -113,7 +72,7 @@ model:
     dropout: 0.1
     fixed_std: null
     learn_fixed_std: False
-    std_min: 0.05
+    std_min: 0.01
     std_max: 1.0
     
   critic:
