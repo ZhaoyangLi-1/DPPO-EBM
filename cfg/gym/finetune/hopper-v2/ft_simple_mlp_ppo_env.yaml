@@ -7,7 +7,7 @@ hydra:
 
 _target_: agent.finetune.train_simple_mlp_ppo_agent.TrainSimpleMLP_PPOAgent
 
-name: ${env_name}_simple_mlp_ppo_env_ta${horizon_steps}
+name: ${env_name}_simple_mlp_ppo_ebm_ta${horizon_steps}
 logdir: ${oc.env:DPPO_LOG_DIR,${hydra:runtime.cwd}/log}/gym-finetune/${name}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
 
 seed: 42
@@ -20,12 +20,12 @@ horizon_steps: 4
 act_steps: 4
 
 env:
-  n_envs: 40
+  n_envs: 40  # 增加环境数，更多样化的经验
   name: ${env_name}
   max_episode_steps: 1000
   reset_at_iteration: False
   save_video: False
-  best_reward_threshold_for_success: 3600  # success rate not relevant for gym tasks
+  best_reward_threshold_for_success: 3600
   wrappers:
     mujoco_locomotion_lowdim:
       normalization_path: ${oc.env:DPPO_DATA_DIR,${hydra:runtime.cwd}/data}/gym/${env_name}/normalization.npz
@@ -39,12 +39,12 @@ env:
 wandb:
   entity: ${oc.env:DPPO_WANDB_ENTITY}
   project: gym-${env_name}-finetune-simple-ppo
-  run: ${name}_SimpleMLP_PPO_Env
+  run: ${name}_SimpleMLP_PPO
   group: ${oc.env:WANDB_GROUP,${env_name}-simple-ppo-baseline}
-  tags: [SimpleMLP, PPO, Env_Reward]
+  tags: [SimpleMLP, PPO, EBM_Reward, Temperature_Smooth]
 
 train:
-  n_train_itr: 200
+  n_train_itr: 100
   n_critic_warmup_itr: 0
   n_steps: 500
   gamma: 0.99
@@ -75,7 +75,6 @@ train:
   vf_coef: 0.5
   target_kl: 0.05
 
-
 model:
   _target_: model.rl.simple_mlp_ppo.SimpleMLP_PPO
   
@@ -84,13 +83,19 @@ model:
   clip_vloss_coef: 0.2
   norm_adv: True
   
-  # Reward configuration - USE ENVIRONMENT REWARD
+  # Reward configuration
   use_ebm_reward: False
-  ebm_reward_scale: 1.0
-  ebm_reward_clip_max: 60.0
+  ebm_reward_scale: 3.0  
+  ebm_reward_clip_max: 20.0
   use_auto_scaling: False
   
-  # EBM configuration (not used but required for structure)
+  # Dynamic normalization with stronger signal
+  use_dynamic_normalization: False
+  normalization_momentum: 0.95  # Faster adaptation (was 0.99)
+  temperature_scale: 0.25  # Much lower for stronger differences (was 1.0)
+  normalization_epsilon: 1e-8  # Numerical stability constant
+  
+  # EBM configuration
   ebm:
     embed_dim: 256
     nhead: 8
@@ -98,6 +103,9 @@ model:
     dropout: 0.0
     use_cls_token: False
     num_views: null
+  
+  # EBM checkpoint path
+  ebm_ckpt_path: /scr/zhaoyang/outputs/gym_one_action_t_idx/Hopper-v2-no-gp/ebm_best_val_hopper-v2-medium.pt
   
   # Network configuration
   actor:

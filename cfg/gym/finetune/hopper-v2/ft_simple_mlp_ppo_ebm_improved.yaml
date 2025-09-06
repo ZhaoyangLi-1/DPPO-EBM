@@ -7,7 +7,7 @@ hydra:
 
 _target_: agent.finetune.train_simple_mlp_ppo_agent.TrainSimpleMLP_PPOAgent
 
-name: ${env_name}_simple_mlp_ppo_env_improved_ta${horizon_steps}
+name: ${env_name}_simple_mlp_ppo_ebm_improved_ta${horizon_steps}
 logdir: ${oc.env:DPPO_LOG_DIR,${hydra:runtime.cwd}/log}/gym-finetune/${name}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
 
 seed: 42
@@ -37,63 +37,70 @@ env:
 
 wandb:
   entity: ${oc.env:DPPO_WANDB_ENTITY}
-  project: gym-${env_name}-finetune-simple-ppo-improved
-  run: ${name}_SimpleMLP_PPO_Env_Improved
-  group: ${oc.env:WANDB_GROUP,${env_name}-simple-ppo-improved}
-  tags: [SimpleMLP, PPO, Env_Reward, Improved]
+  project: gym-${env_name}-finetune-simple-ppo
+  run: ${name}_SimpleMLP_PPO_EBM_Improved
+  group: ${oc.env:WANDB_GROUP,${env_name}-simple-ppo-baseline}
+  tags: [SimpleMLP, PPO, EBM_Improved, Exploration_Bonus]
 
 train:
-  n_train_itr: 400  # 增加训练轮数
+  n_train_itr: 200  # 增加训练轮数
   n_critic_warmup_itr: 0
-  n_steps: 1000  # 增加轨迹长度，提供更多学习信号
-  gamma: 0.995  # 稍微提高折扣因子，重视长期奖励
-  
-  # 改进的学习率调度
-  actor_lr: 5e-4  # 稍微提高初始学习率
+  n_steps: 500
+  gamma: 0.99
+  actor_lr: 3e-4
   actor_weight_decay: 0
   actor_lr_scheduler:
-    first_cycle_steps: 2000  # 更长的学习率周期
-    warmup_steps: 50
-    min_lr: 5e-6  # 更低的最小学习率，允许更长时间细调
-  
-  critic_lr: 2e-3  # 提高critic学习率
+    first_cycle_steps: 1000
+    warmup_steps: 10
+    min_lr: 5e-6
+  critic_lr: 1e-3
   critic_weight_decay: 0
   critic_lr_scheduler:
-    first_cycle_steps: 2000
-    warmup_steps: 50
-    min_lr: 1e-5
-  
+    first_cycle_steps: 1000
+    warmup_steps: 10
+    min_lr: 1e-3
   save_model_freq: 50
   val_freq: 10
   log_freq: 1
   render:
-    freq: 100
+    freq: 50
     num: 0
-  
-  # PPO 改进参数
+  # PPO specific
   reward_scale_running: True
   reward_scale_const: 1.0
-  gae_lambda: 0.98  # 提高GAE lambda，更好的价值估计
-  batch_size: 20000  # 增加批量大小
-  update_epochs: 10  # 增加更新次数
-  vf_coef: 1.0  # 增加价值函数重要性
-  target_kl: 0.02  # 降低KL散度限制，允许更大更新
+  gae_lambda: 0.95
+  batch_size: 20000
+  update_epochs: 5
+  vf_coef: 0.5
+  target_kl: 0.05
 
 model:
   _target_: model.rl.simple_mlp_ppo.SimpleMLP_PPO
   
-  # PPO parameters - 放宽剪切限制
-  clip_ploss_coef: 0.3  # 增加策略剪切系数
-  clip_vloss_coef: 0.3  # 增加价值剪切系数
+  # PPO parameters
+  clip_ploss_coef: 0.2
+  clip_vloss_coef: 0.2
   norm_adv: True
   
-  # Reward configuration
-  use_ebm_reward: False
-  ebm_reward_scale: 1.0
-  ebm_reward_clip_max: 60.0
+  # CRITICAL CHANGE: Disable pure EBM, use mixed rewards
+  use_ebm_reward: False  # 暂时禁用，因为EBM限制了性能上限
+  
+  # Alternative strategy (需要修改代码支持):
+  # use_ebm_reward: True
+  # ebm_weight: 0.3  # 30% EBM + 70% ENV
+  # exploration_bonus: True  # 添加探索奖励
+  
+  ebm_reward_scale: 10.0  # 大幅增加缩放
+  ebm_reward_clip_max: 50.0  # 增加裁剪范围
   use_auto_scaling: False
   
-  # EBM configuration (not used)
+  # More aggressive normalization
+  use_dynamic_normalization: True
+  normalization_momentum: 0.9  # 更快适应
+  temperature_scale: 0.1  # 极低温度，最大化差异
+  normalization_epsilon: 1e-8
+  
+  # EBM configuration
   ebm:
     embed_dim: 256
     nhead: 8
@@ -102,27 +109,30 @@ model:
     use_cls_token: False
     num_views: null
   
-  # 更大的网络架构
+  # EBM checkpoint path
+  ebm_ckpt_path: /scr/zhaoyang/outputs/gym_one_action_t_idx/Hopper-v2-no-gp/ebm_best_val_hopper-v2-medium.pt
+  
+  # Network configuration with more exploration
   actor:
     _target_: model.common.mlp_gaussian.Gaussian_MLP
     action_dim: ${action_dim}
     horizon_steps: ${horizon_steps}
     cond_dim: 11
-    mlp_dims: [512, 512, 256]  # 更大的网络
+    mlp_dims: [256, 256, 256]
     activation_type: ReLU
     tanh_output: True
     residual_style: False
-    use_layernorm: True  # 使用LayerNorm提高训练稳定性
+    use_layernorm: False
     dropout: 0.1
     fixed_std: null
     learn_fixed_std: False
-    std_min: 0.02  # 稍微提高最小探索
-    std_max: 1.5   # 增加最大探索
+    std_min: 0.1  # 增加探索
+    std_max: 1.5  # 允许更大方差
     
   critic:
     _target_: model.common.critic.CriticObs
     cond_dim: 11
-    mlp_dims: [512, 512, 256]  # 更大的网络
+    mlp_dims: [256, 256, 256]
     activation_type: ReLU
     residual_style: False
 

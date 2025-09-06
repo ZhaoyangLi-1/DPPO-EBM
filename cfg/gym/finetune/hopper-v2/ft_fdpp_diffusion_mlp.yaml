@@ -1,13 +1,17 @@
 defaults:
-- _self_
+  - _self_
+
 hydra:
   run:
     dir: ${logdir}
-_target_: agent.finetune.train_ppo_diffusion_ebm_agent.TrainPPODiffusionEBMAgent
-name: ${env_name}_ppo_diffusion_ebm_FIXED_CONSERVATIVE_lambda50_ta${horizon_steps}_td${denoising_steps}_tdf${ft_denoising_steps}
+
+_target_: agent.finetune.train_fdpp_diffusion_agent.TrainFDPPDiffusionAgent
+
+name: ${env_name}_fdpp_diffusion_mlp_kl${kl_weight}_ta${horizon_steps}_td${denoising_steps}_tdf${ft_denoising_steps}
 logdir: ${oc.env:DPPO_LOG_DIR,${hydra:runtime.cwd}/log}/gym-finetune/${name}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
 base_policy_path: ${oc.env:DPPO_LOG_DIR,${hydra:runtime.cwd}/log}/gym-pretrain/hopper-medium-v2_pre_diffusion_mlp_ta4_td20/2024-06-12_23-10-05/checkpoint/state_3000.pt
 normalization_path: ${oc.env:DPPO_DATA_DIR,${hydra:runtime.cwd}/data}/gym/${env_name}/normalization.npz
+
 seed: 42
 device: cuda:0
 env_name: hopper-medium-v2
@@ -18,12 +22,27 @@ ft_denoising_steps: 20
 cond_steps: 1
 horizon_steps: 4
 act_steps: 4
+
+# FDPP specific parameters
+use_preference_reward: True
+kl_weight: 0.01
+preference_buffer_size: 10000
+preference_batch_size: 256
+preference_lr: 1e-4
+preference_update_freq: 10
+n_preference_epochs: 3
+use_trajectory_reward: False
+preference_hidden_dims: [256, 256]
+preference_activation: relu
+preference_output_activation: tanh
+use_action_in_reward: False
+
 env:
   n_envs: 40
   name: ${env_name}
   max_episode_steps: 1000
-  reset_at_iteration: false
-  save_video: false
+  reset_at_iteration: False
+  save_video: False
   best_reward_threshold_for_success: 3
   wrappers:
     mujoco_locomotion_lowdim:
@@ -32,29 +51,27 @@ env:
       n_obs_steps: ${cond_steps}
       n_action_steps: ${act_steps}
       max_episode_steps: ${env.max_episode_steps}
-      reset_within_step: true
+      reset_within_step: True
+
 wandb:
   entity: ${oc.env:DPPO_WANDB_ENTITY}
-  project: gym-${env_name}-finetune-ppo
-  run: ${name}_EBM_FIXED_CONSERVATIVE
-  group: ${oc.env:WANDB_GROUP,${env_name}-ppo-vs-ebm}
-  tags:
-  - DPPO
-  - EBM_Reward_FIXED
-  - Lambda_50
-  - Conservative
+  project: gym-${env_name}-finetune-fdpp
+  run: ${name}_FDPP
+  group: ${oc.env:WANDB_GROUP,${env_name}-fdpp}
+  tags: [FDPP]
+
 train:
   n_train_itr: 100
   n_critic_warmup_itr: 0
   n_steps: 500
   gamma: 0.99
-  actor_lr: 2.0e-05
+  actor_lr: 1e-4
   actor_weight_decay: 0
   actor_lr_scheduler:
     first_cycle_steps: 1000
     warmup_steps: 10
     min_lr: 1e-4
-  critic_lr: 0.0001
+  critic_lr: 1e-3
   critic_weight_decay: 0
   critic_lr_scheduler:
     first_cycle_steps: 1000
@@ -65,17 +82,19 @@ train:
   render:
     freq: 1
     num: 0
-  reward_scale_running: false
+  # PPO specific
+  reward_scale_running: True
   reward_scale_const: 1.0
   gae_lambda: 0.95
-  batch_size: 8000
-  update_epochs: 2
+  batch_size: 50000
+  update_epochs: 5
   vf_coef: 0.5
   target_kl: 1
-  ent_coef: 0.02
-  max_grad_norm: 0.2
+  clip_ratio: 0.2
+
 model:
-  _target_: model.diffusion.diffusion_ppo_ebm.PPODiffusionEBM
+  _target_: model.diffusion.diffusion_ppo.PPODiffusion
+  # HP to tune
   gamma_denoising: 0.99
   clip_ploss_coef: 0.01
   clip_ploss_coef_base: 0.01
@@ -83,65 +102,27 @@ model:
   randn_clip_value: 3
   min_sampling_denoising_std: 0.1
   min_logprob_denoising_std: 0.1
-  use_energy_scaling: true
-  energy_scaling_momentum: 0.95
-  energy_scaling_eps: 1e-6
-  energy_scaling_use_mad: true
-  use_ebm_reward: true
-  ebm_reward_mode: dense
-  ebm_reward_clip_u_max: 25.0
-  ebm_reward_lambda: 50.0
-  ebm_reward_baseline_M: 8
-  ebm_reward_baseline_use_mu_only: false
-  ebm:
-    _target_: model.ebm.EBMWrapper
-    obs_dim: ${obs_dim}
-    action_dim: ${action_dim}
-    hidden_dim: 256
-    num_layers: 4
-    nhead: 8
-    dropout: 0.0
-    num_views: null
-    use_cls_token: false
-  ebm_ckpt_path: /linting-slow-vol/EBM-Guidance/outputs/gym/ebm_best_val_hopper-v2-medium.pt
+  learn_eta: False
+  #
   network_path: ${base_policy_path}
   actor:
     _target_: model.diffusion.mlp_diffusion.DiffusionMLP
     time_dim: 16
-    mlp_dims:
-    - 512
-    - 512
-    - 512
+    mlp_dims: [512, 512, 512]
     activation_type: ReLU
-    residual_style: true
+    residual_style: True
     cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
     horizon_steps: ${horizon_steps}
     action_dim: ${action_dim}
   critic:
     _target_: model.common.critic.CriticObs
     cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
-    mlp_dims:
-    - 256
-    - 256
-    - 256
+    mlp_dims: [256, 256, 256]
     activation_type: Mish
-    residual_style: true
+    residual_style: True
   ft_denoising_steps: ${ft_denoising_steps}
   horizon_steps: ${horizon_steps}
   obs_dim: ${obs_dim}
   action_dim: ${action_dim}
   denoising_steps: ${denoising_steps}
   device: ${device}
-ebm_calibration:
-  scaling_type: conservative
-  lambda_value: 50.0
-  expected_reward_range:
-  - -1000.0
-  - 1000.0
-  description: Conservative EBM scaling - safe starting point
-  fixes_applied:
-  - Proper EBM-to-env reward scaling
-  - Dense mode (all denoising steps)
-  - Conservative training hyperparameters
-  - Disabled reward normalization
-  - Strict gradient clipping
