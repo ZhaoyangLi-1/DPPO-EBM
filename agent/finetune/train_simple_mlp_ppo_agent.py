@@ -124,7 +124,6 @@ class TrainSimpleMLP_PPOAgent(TrainPPOAgent):
         if not self.use_ebm_reward or self.ebm_model is None:
             return np.zeros((self.n_steps, self.n_envs))
         ebm_rewards = np.zeros((self.n_steps, self.n_envs))
-        env_step_counters = np.zeros(self.n_envs, dtype=int)
         try:
             with torch.no_grad():
                 for step in range(self.n_steps):
@@ -135,13 +134,8 @@ class TrainSimpleMLP_PPOAgent(TrainPPOAgent):
                     states = batch_obs['state']
                     if states.dim() == 3:
                         states = states[:, -1]
-                    if firsts_trajs is not None and firsts_trajs.shape[0] >= step:
-                        resets = firsts_trajs[step].astype(bool)
-                        env_step_counters[resets] = 0
-                    env_t_idx = torch.from_numpy(env_step_counters).long().to(self.device)
-                    max_t = int(getattr(self, "max_episode_steps", 1000) - 1)
-                    env_t_idx = torch.clamp(env_t_idx, 0, max_t)
-                    env_step_counters += 1
+                    # Use fixed t_idx=0 for all time steps (remove time dependency)
+                    env_t_idx = torch.zeros(B, device=self.device, dtype=torch.long)
                     ebm_output = self.ebm_model(
                         k_idx=k_idx,
                         t_idx=env_t_idx,
